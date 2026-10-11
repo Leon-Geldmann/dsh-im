@@ -540,6 +540,101 @@ export class DiscordBotClient {
   #operationSignal(signal) {
     return signal ?? this.#signal;
   }
+
+  /**
+   * Send one card with buttons. The shared renderers own the text and the
+   * button ids, so a card and its text-reply fallback describe one request.
+   */
+  async #sendButtonCard(target, { text, markup }) {
+    const rows = Array.isArray(markup?.rows) ? markup.rows : [];
+    const components = rows
+      .map((row) => ({
+        type: 1,
+        components: (Array.isArray(row) ? row : [])
+          .filter((button) => button && typeof button.id === 'string' && button.id)
+          .slice(0, 5)
+          .map((button) => ({
+            type: 2,
+            style: [1, 2, 3, 4].includes(button.style) ? button.style : 2,
+            label: String(button.label ?? '').slice(0, 80) || '选择',
+            custom_id: button.id,
+          })),
+      }))
+      .filter((row) => row.components.length > 0)
+      .slice(0, 5);
+    const message = await this.#api.createMessage({
+      channelId: target.channelId,
+      content: text,
+      replyToMessageId: target.replyToMessageId,
+      components,
+      signal: this.#signal,
+    });
+    return { providerMessageIds: typeof message?.id === 'string' ? [message.id] : [] };
+  }
+
+  sendApprovalCard(target, card) {
+    return this.#sendButtonCard(target, card);
+  }
+
+  sendInteractionCard(target, card) {
+    // A question card is a normal message: the shared bridge tracks the card id
+    // it returns and retires the buttons once the question is answered.
+    return this.#sendButtonCard(target, card);
+  }
+
+  /** Replace a card's buttons with the given set (an empty set retires them). */
+  #updateButtonCard(target, messageId, { markup }) {
+    const rows = Array.isArray(markup?.rows) ? markup.rows : [];
+    const components = rows
+      .map((row) => ({
+        type: 1,
+        components: (Array.isArray(row) ? row : []).slice(0, 5).map((button) => ({
+          type: 2,
+          style: [1, 2, 3, 4].includes(button.style) ? button.style : 2,
+          label: String(button.label ?? '').slice(0, 80) || '选择',
+          custom_id: String(button.id ?? ''),
+        })),
+      }))
+      .filter((row) => row.components.length > 0);
+    return this.#api.editMessage({
+      channelId: target.channelId,
+      messageId,
+      components,
+      signal: this.#signal,
+    });
+  }
+
+  updateApprovalCard(target, messageId, card) {
+    return this.#updateButtonCard(target, messageId, card);
+  }
+
+  updateInteractionCard(target, messageId, card) {
+    return this.#updateButtonCard(target, messageId, card);
+  }
+
+  /**
+   * Acknowledge a button press. Discord requires a response within seconds, so
+   * the acknowledgement is an ephemeral interaction reply rather than a new
+   * channel message.
+   */
+  async answerInteractionCallback(_callbackQueryId, text, callback = {}) {
+    const interactionId = callback.interactionId ?? _callbackQueryId;
+    const interactionToken = callback.interactionToken;
+    if (!interactionId || !interactionToken) return;
+    await this.#api.createInteractionResponse({
+      interactionId,
+      interactionToken,
+      body: {
+        type: 4,
+        data: {
+          content: String(text ?? '').slice(0, 1_900),
+          flags: 64,
+          allowed_mentions: { parse: [], replied_user: false },
+        },
+      },
+      signal: this.#signal,
+    });
+  }
 }
 
 export function createDiscordRuntimeStatus() {
@@ -930,7 +1025,7 @@ export class DiscordRuntime {
         } else if (packet.t === 'INTERACTION_CREATE') {
           const interactions = this.#interactions;
           if (packet.d && interactions) {
-            void interactions.handle(packet.d).catch((error) => {
+            void this.#handleInteractionEvent(packet.d, interactions).catch((error) => {
               this.#logger.error?.(
                 `[dsh-im:discord] bot ${this.#config.botId} interaction handling failed:`,
                 extractConnectionEvidence(error).details,
@@ -974,6 +1069,44 @@ export class DiscordRuntime {
   #rememberChannel(channel) {
     if (!channel?.id) return;
     this.#channels.set(String(channel.id), channel);
+  }
+
+  /**
+   * Route one INTERACTION_CREATE. Question and approval card presses belong to
+   * the shared bridge; everything else goes to the workbench command layer,
+   * which owns the operator gate and the Guild check.
+   */
+  async #handleInteractionEvent(interaction, interactions) {
+    if (await this.#handleBridgeCardPress(interaction)) return;
+    await interactions.handle(interaction);
+  }
+
+  async #handleBridgeCardPress(interaction) {
+    if (Number(interaction?.type) !== 3 || !this.#bridge) return false;
+    const customId = interaction?.data?.custom_id;
+    const prefix = typeof customId === 'string' ? customId.split(':', 1)[0] : '';
+    if (prefix !== 'wbq' && prefix !== 'wba') return false;
+    const senderId = String(interaction?.member?.user?.id ?? interaction?.user?.id ?? '');
+    const channelId = String(interaction?.channel_id ?? '');
+    if (!senderId || !channelId) return false;
+    const callback = {
+      conversationId: channelId,
+      senderId,
+      messageId: String(interaction?.message?.id ?? ''),
+      kind: interaction?.guild_id ? 'group' : 'direct',
+      senderIsBot: false,
+      data: customId,
+      callbackQueryId: interaction.id,
+      interactionId: interaction.id,
+      interactionToken: interaction.token,
+      replyTarget: { channelId },
+    };
+    if (prefix === 'wba') {
+      await this.#bridge.acceptApprovalCallback?.(callback);
+      return true;
+    }
+    await this.#bridge.acceptCallback?.(callback);
+    return true;
   }
 
   /** Replace this bot's Guild-scoped command set with the workbench menu. */

@@ -236,6 +236,11 @@ export default {
   '检测到这个 Session 中遗留的待回答问题，已安全取消并继续处理你刚才的消息。':
     'A pending question left over in this Session was detected. It has been safely cancelled, and your latest message is being processed.',
   // Inline-keyboard question cards (text-harness-bridge.mjs).
+  '这个审批卡片已失效。': 'This approval card is no longer valid.',
+  '无法识别的审批选项。': 'This approval option is not recognised.',
+  '这个审批已处理或已失效。': 'This approval was already handled or has expired.',
+  '已批准一次。': 'Approved once.',
+  '已拒绝。': 'Rejected.',
   '该问题已处理，无需再次选择。':
     'This question has already been handled; no further choice is needed.',
   '只有发起当前任务的用户可以处理这条问题。':

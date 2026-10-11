@@ -193,6 +193,8 @@ export class TextHarnessBridge {
   #sessionResolver;
   #routingMessage;
   #commandOverride;
+  #approvalCard;
+  #approvalTokens = new Map();
   // Delivery attempts per message id. A failed turn releases its `markSeen` so
   // the next poll can retry, and this counter is what keeps that from becoming
   // an infinite loop on a mail that always fails.
@@ -221,6 +223,10 @@ export class TextHarnessBridge {
     // shared command families run. It returns operator-facing text to refuse
     // the command, or null to keep legacy behavior.
     commandOverride = null,
+    // Optional channel renderer for Harness approvals: approve-once / reject
+    // buttons instead of the text-reply path. Channels without one keep the
+    // shared text flow untouched.
+    approvalCard = null,
   }) {
     if (!descriptor?.key || !descriptor?.label) throw new TypeError('A channel descriptor is required');
     if (!bot || typeof bot.sendText !== 'function') throw new TypeError('A bot client is required');
@@ -241,6 +247,7 @@ export class TextHarnessBridge {
     this.#sessionResolver = typeof sessionResolver === 'function' ? sessionResolver : null;
     this.#routingMessage = typeof routingMessage === 'function' ? routingMessage : null;
     this.#commandOverride = typeof commandOverride === 'function' ? commandOverride : null;
+    this.#approvalCard = approvalCard ?? null;
     this.#deferred = createDeferredDeliveryCoordinator({ harness, state, signal, logger,
       deliver: (entry, outcome) => this.#deliverDeferredOutcome(entry, outcome),
     });
@@ -1351,7 +1358,7 @@ export class TextHarnessBridge {
   async #answerInteractionCallback(callback, text) {
     if (typeof this.#bot.answerInteractionCallback !== 'function') return;
     try {
-      await this.#bot.answerInteractionCallback(callback.callbackQueryId, text);
+      await this.#bot.answerInteractionCallback(callback.callbackQueryId, text, callback);
     } catch (error) {
       this.#logger.warn?.(
         `[dsh-im:${this.#descriptor.key}] could not acknowledge a button press:`,
@@ -1461,6 +1468,77 @@ export class TextHarnessBridge {
     });
   }
 
+  /**
+   * Build the approval card renderer for one conversation, or null when the
+   * channel cannot carry buttons. The card text always comes from the shared
+   * approval presentation, so a card and a text prompt describe one request.
+   */
+  #approvalRenderer({ target }) {
+    if (!this.#approvalCard || typeof this.#bot.sendApprovalCard !== 'function') return null;
+    if (typeof this.#approvalCard.render !== 'function') return null;
+    return async (pending, sendFallback) => {
+      const token = randomUUID();
+      const nonce = randomUUID().slice(0, 8);
+      let card = null;
+      try {
+        card = this.#approvalCard.render(pending, { token, nonce });
+      } catch (error) {
+        this.#logger.warn?.(
+          `[dsh-im:${this.#descriptor.key}] approval card renderer failed:`,
+          error,
+        );
+      }
+      if (!card || typeof card.text !== 'string' || !card.text || !card.markup) {
+        await sendFallback(pending.text);
+        return;
+      }
+      this.#approvalTokens.set(token, { approvalId: pending.approvalId, nonce });
+      const sent = await this.#bot.sendApprovalCard(target, {
+        text: card.text,
+        markup: card.markup,
+      });
+      pending.cardMessageId = sent?.providerMessageIds?.at(-1) ?? null;
+      pending.cardToken = token;
+    };
+  }
+
+  /**
+   * Accept an approval-button press. The button only carries an opaque token;
+   * the pending request, its actor and its state live in the approval queue, so
+   * a stale or forwarded press is answered with the real state.
+   */
+  async acceptApprovalCallback(callback) {
+    if (this.#signal?.aborted) return;
+    const notice = (text) => this.#answerInteractionCallback(callback, text);
+    const parsed = this.#approvalCard?.parse?.(callback?.data) ?? null;
+    if (!parsed) return notice(t('这个审批卡片已失效。'));
+    const entry = this.#approvalTokens.get(parsed.token);
+    if (!entry || entry.nonce !== parsed.nonce) return notice(t('这个审批卡片已失效。'));
+    if (parsed.outcome !== 'approved' && parsed.outcome !== 'rejected') {
+      return notice(t('无法识别的审批选项。'));
+    }
+    const submitted = await this.#approvals.submitByApprovalId(
+      entry.approvalId,
+      parsed.outcome,
+      { actor: callback?.senderId },
+    );
+    if (!submitted) return notice(t('这个审批已处理或已失效。'));
+    this.#approvalTokens.delete(parsed.token);
+    await notice(parsed.outcome === 'approved' ? t('已批准一次。') : t('已拒绝。'));
+    if (callback?.messageId && typeof this.#bot.updateApprovalCard === 'function') {
+      await this.#bot.updateApprovalCard(
+        { channelId: callback.conversationId },
+        callback.messageId,
+        { markup: { rows: [] } },
+      ).catch((error) => {
+        this.#logger.warn?.(
+          `[dsh-im:${this.#descriptor.key}] could not retire an answered approval card:`,
+          error?.message ?? error,
+        );
+      });
+    }
+  }
+
   async #handleInteraction(interaction, {
     key,
     actor,
@@ -1473,6 +1551,7 @@ export class TextHarnessBridge {
         actor,
         requiresMention,
         send: (text) => this.#bot.sendText(target, text),
+        render: this.#approvalRenderer({ target }) ?? undefined,
       });
     }
     if (interaction?.kind !== 'question') return;
