@@ -1,6 +1,6 @@
 import {
+  conversationKeyMatchesTarget,
   deliverySuggestionsFromSessions,
-  privateConversationKeyMatchesTarget,
   resolvePrivateConversationKey,
 } from './delivery-suggestions.mjs';
 
@@ -199,7 +199,7 @@ function stateSessions(state) {
 
 function sessionSyncView(channel, target, sessions, configured) {
   if (configured) {
-    const valid = privateConversationKeyMatchesTarget(
+    const valid = conversationKeyMatchesTarget(
       channel,
       configured.conversationKey,
       target,
@@ -234,7 +234,7 @@ export function createDeliveryAdapter({ channel, workspaces, coreController, sta
   const syncTarget = async (botId, targetId, sessionId) => {
     const configured = sessionSyncConfigs(workspaces, botId).find((entry) => entry.targetId === targetId);
     const target = workspaces.deliveryTargetFor(botId, targetId);
-    if (!configured || !target || !privateConversationKeyMatchesTarget(channel, configured.conversationKey, target)) {
+    if (!configured || !target || !conversationKeyMatchesTarget(channel, configured.conversationKey, target)) {
       throw sessionSyncUnavailable('Session sync target is no longer enabled');
     }
     const sessions = stateSessions(await stateFor(botId));
@@ -349,7 +349,7 @@ export function createDeliveryAdapter({ channel, workspaces, coreController, sta
       const matches = [];
       for (const configured of sessionSyncConfigs(workspaces)) {
         const target = workspaces.deliveryTargetFor(configured.botId, configured.targetId);
-        if (!target || !privateConversationKeyMatchesTarget(
+        if (!target || !conversationKeyMatchesTarget(
           channel,
           configured.conversationKey,
           target,

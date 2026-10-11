@@ -4,6 +4,7 @@ import {
   TokenBotConfigStore,
 } from '../shared/token-config-store.mjs';
 import { t } from '../shared/i18n.mjs';
+import { sanitizeWorkbenchConfig } from './workbench/access.mjs';
 
 const IDENTITY_OPTIONS = Object.freeze({
   botPrefix: 'discord',
@@ -24,22 +25,30 @@ export class DiscordConfigStore extends TokenBotConfigStore {
       channel: 'Discord',
       ...IDENTITY_OPTIONS,
       normalizeBotExtension(value) {
-        if (value.ownerUserId == null) return { ownerUserId: null };
+        const workbench = sanitizeWorkbenchConfig(value.workbench);
+        if (value.ownerUserId == null) {
+          return { ownerUserId: null, ...(workbench ? { workbench } : {}) };
+        }
         const ownerUserId = typeof value.ownerUserId === 'string' ? value.ownerUserId.trim() : '';
         if (!/^\d{5,30}$/.test(ownerUserId) || ownerUserId === value.platformId?.trim()) return null;
-        return { ownerUserId };
+        return { ownerUserId, ...(workbench ? { workbench } : {}) };
       },
     });
   }
 
   save(value) {
     // Shared credential binding rebuilds the base config. Preserve only this
-    // bot's confirmed identity when omitted; explicit null still clears it.
+    // bot's confirmed identity and its workbench block when omitted; explicit
+    // null still clears them.
+    const existing = value?.botId ? this.get(value.botId) : null;
     return super.save({
       ...value,
       ownerUserId: value?.ownerUserId === undefined
-        ? this.get(value?.botId)?.ownerUserId ?? null
+        ? existing?.ownerUserId ?? null
         : value.ownerUserId,
+      ...(value?.workbench === undefined && existing?.workbench
+        ? { workbench: existing.workbench }
+        : {}),
     });
   }
 }

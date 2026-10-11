@@ -7,6 +7,9 @@ import { captureContextEnhancement } from '../shared/context-enhancement.mjs';
 import { evaluateInboundAccess } from '../shared/inbound-access.mjs';
 import { DiscordApi } from './discord-api.mjs';
 import { createDiscordBridgeStatus, DiscordHarnessBridge } from './discord-bridge.mjs';
+import { DiscordGuildWorkbench } from './workbench/guild-workbench.mjs';
+import { WorkbenchCommands, WORKBENCH_COMMANDS } from './workbench/commands.mjs';
+import { DiscordInteractionHandler } from './workbench/interactions.mjs';
 
 const DISCORD_GATEWAY_INTENTS = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15);
 const THREAD_RECOVERY_TIMEOUT_MS = 5_000;
@@ -121,6 +124,31 @@ function withConversationRoute(normalized, channel, botId, {
       ...(thread ? { threadId: channelId, managed } : {}),
       ...(fallback ? { fallback } : {}),
     },
+  };
+}
+
+/**
+ * Guild-workbench routing: one managed text channel is its own conversation
+ * route, so the message never opens a Thread and never needs a mention.
+ */
+export function withWorkbenchRoute(normalized, channelId) {
+  const id = String(channelId);
+  return {
+    ...normalized,
+    conversationId: id,
+    addressed: true,
+    requiresMention: false,
+    replyTarget: {
+      channelId: id,
+      ...(normalized.replyTarget?.replyToMessageId
+        ? { replyToMessageId: normalized.replyTarget.replyToMessageId }
+        : {}),
+    },
+    reactionTarget: normalized.reactionTarget
+      ? { ...normalized.reactionTarget, channelId: id }
+      : { channelId: id, messageId: normalized.messageId },
+    connectionTestTarget: { channelId: id },
+    conversationRoute: { peerId: id },
   };
 }
 
@@ -559,6 +587,12 @@ export class DiscordRuntime {
   #starting = null;
   #channels = new Map();
   #routing = new Map();
+  #workbench = null;
+  #workbenchError = null;
+  #workbenchAdmin = null;
+  #commands = null;
+  #interactions = null;
+  #commandsRegisteredAt = null;
 
   constructor({
     config,
@@ -567,6 +601,9 @@ export class DiscordRuntime {
     state,
     contextEnhancement,
     accessPolicy,
+    workbench = null,
+    workbenchStore = null,
+    workbenchAdmin = null,
     logger = console,
     replyTimeoutMs = 600_000,
     connectTimeoutMs = 20_000,
@@ -590,6 +627,42 @@ export class DiscordRuntime {
     this.#createApi = createApi;
     this.#createWebSocket = createWebSocket;
     this.#random = random;
+    this.#workbenchAdmin = typeof workbenchAdmin === 'object' ? workbenchAdmin : null;
+    try {
+      this.#workbench = workbench?.enabled
+        ? new DiscordGuildWorkbench({
+          config: workbench,
+          store: workbenchStore,
+          harness,
+          ownerUserId: config.ownerUserId ?? null,
+          logger,
+        })
+        : null;
+    } catch (error) {
+      // A damaged workbench configuration must not take the whole bot down;
+      // the legacy Discord behavior stays available and /status reports it.
+      this.#workbench = null;
+      this.#workbenchError = error?.message ?? String(error);
+      logger.warn?.('[dsh-im:discord] workbench is not available:', this.#workbenchError);
+    }
+  }
+
+  get workbench() { return this.#workbench; }
+  get workbenchAdmin() { return this.#workbenchAdmin; }
+
+  /**
+   * Re-send this bot's Guild command menu in the current host language. Returns
+   * false when the workbench is disabled or the platform call failed.
+   */
+  async refreshCommandMenu() {
+    if (!this.#workbench || !this.#api) return false;
+    try {
+      await this.#registerGuildCommands(this.#api, this.#abortController?.signal);
+      return true;
+    } catch (error) {
+      this.#logger.warn?.('[dsh-im:discord] command menu refresh failed:', extractConnectionEvidence(error).details);
+      return false;
+    }
   }
 
   get status() {
@@ -609,8 +682,19 @@ export class DiscordRuntime {
     if (!this.#status.ready || !this.#bridge) return false;
     const channelId = target?.route?.channelId;
     const channel = await this.#api.getChannel({ channelId, signal: options.signal });
-    const actor = channel?.type === 1 && channel.recipients?.length === 1
-      ? channel.recipients[0]?.id : '';
+    let actor = '';
+    if (channel?.type === 1 && channel.recipients?.length === 1) {
+      actor = channel.recipients[0]?.id ?? '';
+    } else if (this.#workbench && [0, 5].includes(Number(channel?.type))) {
+      // A Guild-workbench channel has no single recipient; the approval is
+      // attributed to the configured operator so the access check and the
+      // answer path stay tied to one accountable user.
+      const managed = this.#workbench.store.channel(String(channelId));
+      if (managed) {
+        actor = this.#workbench.config.allowedUserIds[0]
+          ?? String(this.#config.ownerUserId ?? '');
+      }
+    }
     if (!actor) return false;
     return this.#bridge.presentSessionSyncApproval(interaction, {
       key: options.key, actor, validate: options.validate,
@@ -681,7 +765,32 @@ export class DiscordRuntime {
         logger: this.#logger,
         replyTimeoutMs: this.#replyTimeoutMs,
         signal: controller.signal,
+        ...(this.#workbench ? {
+          sessionResolver: (context) => this.#workbench.sessionResolver(context),
+          routingMessage: (error) => this.#workbench.routingMessage(error),
+          commandOverride: (text, options) => this.#workbench.commandOverride(text, options),
+        } : {}),
       });
+      if (this.#workbench) {
+        // The interaction handler and command layer are bound to the live API
+        // instance of this connection; a reconnect replaces both.
+        this.#commands = new WorkbenchCommands({
+          workbench: this.#workbench,
+          api,
+          harness: this.#harness,
+          admin: this.#workbenchAdmin,
+          queue: this.#workbench.queue,
+          logger: this.#logger,
+        });
+        this.#interactions = new DiscordInteractionHandler({
+          workbench: this.#workbench,
+          api,
+          applicationId: (interaction) => interaction?.application_id
+            ?? String(bot?.id ?? this.#config.platformId),
+          commands: this.#commands,
+          logger: this.#logger,
+        });
+      }
       let timer;
       try {
         await Promise.race([
@@ -786,6 +895,14 @@ export class DiscordRuntime {
           this.#sessionId = packet.d?.session_id ?? null;
           this.#resumeUrl = packet.d?.resume_gateway_url ?? null;
           markReady();
+          if (this.#workbench) {
+            void this.#registerGuildCommands(this.#api, this.#abortController?.signal).catch((error) => {
+              this.#logger.warn?.(
+                '[dsh-im:discord] Guild command registration failed:',
+                extractConnectionEvidence(error).details,
+              );
+            });
+          }
         } else if (packet.t === 'RESUMED') {
           markReady();
         } else if (packet.t === 'GUILD_CREATE') {
@@ -806,6 +923,16 @@ export class DiscordRuntime {
               if (generation !== this.#generation || this.#stopped) return;
               this.#logger.error?.(
                 `[dsh-im:discord] bot ${this.#config.botId} message handling failed:`,
+                extractConnectionEvidence(error).details,
+              );
+            });
+          }
+        } else if (packet.t === 'INTERACTION_CREATE') {
+          const interactions = this.#interactions;
+          if (packet.d && interactions) {
+            void interactions.handle(packet.d).catch((error) => {
+              this.#logger.error?.(
+                `[dsh-im:discord] bot ${this.#config.botId} interaction handling failed:`,
                 extractConnectionEvidence(error).details,
               );
             });
@@ -849,10 +976,61 @@ export class DiscordRuntime {
     this.#channels.set(String(channel.id), channel);
   }
 
+  /** Replace this bot's Guild-scoped command set with the workbench menu. */
+  async #registerGuildCommands(api, signal) {
+    const applicationId = String(this.#config.platformId ?? '');
+    const result = await api.bulkOverwriteGuildCommands({
+      applicationId,
+      guildId: this.#workbench.guildId,
+      commands: WORKBENCH_COMMANDS,
+      signal,
+    });
+    this.#commandsRegisteredAt = new Date().toISOString();
+    return result;
+  }
+
   async #acceptMessage(message, bridge) {
     const messageId = String(message?.id ?? '');
     if (!messageId || this.#state.hasSeen(messageId)) return;
     const preflight = normalizeDiscordMessage(message, this.#config.platformId);
+    if (!preflight || preflight.senderIsBot === true) return;
+
+    // Guild workbench: the bound Guild routes only through the operator gate,
+    // and a managed channel keeps one fixed Session without threads or
+    // mentions. Everything the workbench does not claim keeps legacy behavior.
+    if (this.#workbench && message.guild_id) {
+      const channelId = String(message.channel_id ?? preflight.conversationId);
+      let channel = this.#channels.get(channelId) ?? null;
+      if (!channel && typeof this.#api?.getChannel === 'function') {
+        channel = await this.#api.getChannel({
+          channelId,
+          signal: this.#abortController?.signal,
+        }).catch(() => null);
+        if (channel) this.#rememberChannel(channel);
+      }
+      const decision = this.#workbench.classifyChannelMessage(message, { channel });
+      if (decision.managed) {
+        if (decision.register) {
+          await this.#workbench.registerChannel({
+            channelId: decision.channelId,
+            projectId: decision.projectId,
+            title: typeof channel?.name === 'string' ? channel.name : null,
+          });
+        }
+        await bridge.accept(withWorkbenchRoute(preflight, decision.channelId), {
+          contextSnapshot: captureContextEnhancement(this.#contextEnhancement, 'group'),
+          busyMessageMode: this.#harness.currentBusyMessageMode?.() ?? 'queue',
+          accessDecision: { allowed: true, reason: 'workbench-operator' },
+        });
+        return;
+      }
+      // A non-operator never triggers a task anywhere in the bound Guild, not
+      // even through the legacy mention/thread path. An operator's message in
+      // an unmapped channel keeps the legacy behavior.
+      if (String(message.guild_id) === this.#workbench.guildId
+        && decision.reason === 'not-operator') return;
+    }
+
     let accessDecision;
     if (preflight?.kind === 'group' && preflight.addressed === true
       && preflight.senderIsBot !== true) {

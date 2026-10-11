@@ -398,3 +398,51 @@ test('channel-specific route kinds stay strict', () => {
     (error) => error?.code === 'invalid-target',
   );
 });
+
+test('a Discord workbench channel key enables Session sync for its own channel target', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-sync-workbench-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const botId = 'discord_sync_test';
+  const channelId = '123456789012345678';
+  const state = await new DiscordStateStore(join(directory, 'state.json')).load();
+  await state.setSession(`group:${channelId}`, 'session-alpha');
+  const target = { targetId: 'workbench', kind: 'channel', route: { channelId } };
+  const workspaces = {
+    has: (id) => id === botId,
+    listDeliveryTargets: () => [target],
+    listSessionSyncTargets: () => [{
+      botId,
+      targetId: 'workbench',
+      conversationKey: `group:${channelId}`,
+    }],
+    deliveryTargetFor: () => target,
+    setDeliveryTargetSessionSync: async () => undefined,
+  };
+  const adapter = createDeliveryAdapter({
+    channel: 'discord',
+    workspaces,
+    coreController: { async sendProactiveText() {} },
+    stateFor: async () => state,
+  });
+  const listed = await adapter.listSessionSyncTargets('session-alpha');
+  assert.deepEqual(listed, [{ botId, targetId: 'workbench' }]);
+
+  // A key naming a different channel must not enable sync for this target.
+  const otherTarget = { targetId: 'other', kind: 'channel', route: { channelId: '223456789012345678' } };
+  const otherAdapter = createDeliveryAdapter({
+    channel: 'discord',
+    workspaces: {
+      ...workspaces,
+      listDeliveryTargets: () => [otherTarget],
+      listSessionSyncTargets: () => [{
+        botId,
+        targetId: 'other',
+        conversationKey: `group:${channelId}`,
+      }],
+      deliveryTargetFor: () => otherTarget,
+    },
+    coreController: { async sendProactiveText() {} },
+    stateFor: async () => state,
+  });
+  assert.deepEqual(await otherAdapter.listSessionSyncTargets('session-alpha'), []);
+});

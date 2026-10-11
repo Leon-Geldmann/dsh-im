@@ -190,6 +190,9 @@ export class TextHarnessBridge {
   #approvals;
   #batches = new BatchInputManager();
   #interactionCard;
+  #sessionResolver;
+  #routingMessage;
+  #commandOverride;
   // Delivery attempts per message id. A failed turn releases its `markSeen` so
   // the next poll can retry, and this counter is what keeps that from becoming
   // an infinite loop on a mail that always fails.
@@ -209,6 +212,15 @@ export class TextHarnessBridge {
     signal,
     keepaliveIntervalMs = 4_000,
     interactionCard = null,
+    // Channel-owned routing hooks. `sessionResolver` replaces the default
+    // resolve-or-create Session binding for this conversation; `routingMessage`
+    // turns one routing error into operator-facing text.
+    sessionResolver = null,
+    routingMessage = null,
+    // Optional channel guard consulted for typed `/` commands before the
+    // shared command families run. It returns operator-facing text to refuse
+    // the command, or null to keep legacy behavior.
+    commandOverride = null,
   }) {
     if (!descriptor?.key || !descriptor?.label) throw new TypeError('A channel descriptor is required');
     if (!bot || typeof bot.sendText !== 'function') throw new TypeError('A bot client is required');
@@ -226,6 +238,9 @@ export class TextHarnessBridge {
     this.#signal = signal;
     this.#keepaliveIntervalMs = keepaliveIntervalMs;
     this.#interactionCard = interactionCard ?? null;
+    this.#sessionResolver = typeof sessionResolver === 'function' ? sessionResolver : null;
+    this.#routingMessage = typeof routingMessage === 'function' ? routingMessage : null;
+    this.#commandOverride = typeof commandOverride === 'function' ? commandOverride : null;
     this.#deferred = createDeferredDeliveryCoordinator({ harness, state, signal, logger,
       deliver: (entry, outcome) => this.#deliverDeferredOutcome(entry, outcome),
     });
@@ -745,6 +760,18 @@ export class TextHarnessBridge {
         await this.#bot.sendText(target, t('{label}机器人与 DeepSeek Harness 连接正常。', { label: this.#descriptor.label }));
         return;
       }
+      if (this.#commandOverride) {
+        const refusal = await this.#commandOverride(text, {
+          key: conversationKey,
+          message,
+          hasImages,
+          hasFiles,
+        });
+        if (refusal) {
+          await this.#bot.sendText(target, refusal);
+          return;
+        }
+      }
       const workspaceCommand = !hasImages && !hasFiles
         ? await runWorkspaceCommand(text, this.#harness, conversationKey)
         : null;
@@ -870,6 +897,9 @@ export class TextHarnessBridge {
         titleText: batchSubmission?.title,
         sourceGuidance: snapshot?.config?.guidance,
         contextEnhanced,
+        resolveSession: this.#sessionResolver
+          ? (context) => this.#sessionResolver({ ...context, message })
+          : undefined,
         createOptions: this.#signal ? { signal: this.#signal } : undefined,
         existsOptions: this.#signal ? { signal: this.#signal } : undefined,
         askOptions: {
@@ -1055,8 +1085,9 @@ export class TextHarnessBridge {
       };
       const imageErrorMessage = imagePromptUserMessage(error);
       const fileErrorMessage = inboundFileUserMessage(error);
+      const routingErrorMessage = this.#routingMessage?.(error) ?? null;
       const failure = setLastMessageFailure(this.#status, error, {
-        userMessage: fileErrorMessage ?? imageErrorMessage,
+        userMessage: routingErrorMessage ?? fileErrorMessage ?? imageErrorMessage,
         reason: imagePromptDiagnostic(error)?.reason,
       });
       const failureText = failedBatch?.retained

@@ -167,6 +167,24 @@ export function privateConversationKeyMatchesTarget(channel, key, target) {
   return suggestionIdentity !== null && suggestionIdentity === routeIdentity(target);
 }
 
+/**
+ * Check that one saved conversation key identifies this target route.
+ *
+ * Besides private conversations this accepts a Guild-workbench channel key
+ * (`group:<channelId>`) for channels whose delivery route is that plain
+ * channel, so a Discord server channel can carry Session sync. The key is only
+ * accepted when the target's own route names the same channel.
+ */
+export function conversationKeyMatchesTarget(channel, key, target) {
+  if (privateConversationKeyMatchesTarget(channel, key, target)) return true;
+  if (channel !== 'discord' || typeof key !== 'string' || !key.startsWith('group:')) return false;
+  const channelId = key.slice('group:'.length);
+  if (!/^\d{5,30}$/.test(channelId)) return false;
+  const identity = routeIdentity(target);
+  if (identity === null) return false;
+  return identity === routeIdentity({ kind: 'channel', route: { channelId } });
+}
+
 /** Resolve exactly one current private conversation for a normalized delivery target. */
 export function resolvePrivateConversationKey(channel, sessions, target) {
   if (!CHANNELS.has(channel) || !isRecord(sessions)) return null;

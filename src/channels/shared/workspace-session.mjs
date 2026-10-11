@@ -102,6 +102,12 @@ export async function askInWorkspaceSession({
   existsOptions,
   askOptions,
   deferredDelivery,
+  // Optional channel-owned Session resolver. The Guild workbench uses it to
+  // keep a channel's fixed Session binding: the resolver either returns the
+  // binding to use or throws, so a vanished Session is reported instead of
+  // being silently recreated. Channels without it keep the original
+  // resolve-or-create behavior.
+  resolveSession,
 }) {
   const initialTitle = contextEnhanced
     ? initialSessionTitle({
@@ -117,6 +123,31 @@ export async function askInWorkspaceSession({
     try {
       const binding = await withSessionBindingLock(state, key, async () => {
         await awaitPendingConversationSwitch(harness, key);
+        if (typeof resolveSession === 'function') {
+          const resolved = await resolveSession({
+            harness,
+            state,
+            key,
+            sessionExists,
+            createSession,
+            workspaceSession,
+            titleText: titleText ?? text,
+            signal: renameSignal,
+          });
+          if (!resolved?.sessionId || !resolved.session) {
+            throw new Error('The channel Session resolver returned no binding');
+          }
+          if (resolved.created === true && initialTitle
+            && typeof resolved.session.renameTitle === 'function') {
+            try {
+              await resolved.session.renameTitle(initialTitle, renameOptions);
+            } catch (error) {
+              if (error?.code === WORKSPACE_SESSION_STALE || renameOptions?.signal?.aborted) throw error;
+              console.warn('[dsh-im] unable to set the initial Session title:', error?.message ?? error);
+            }
+          }
+          return { sessionId: resolved.sessionId, session: resolved.session };
+        }
         let sessionId = state.sessionFor(key);
         let session = sessionId ? workspaceSession(harness, sessionId, key) : null;
         if (!session || !(await sessionExists(session, existsOptions))) {

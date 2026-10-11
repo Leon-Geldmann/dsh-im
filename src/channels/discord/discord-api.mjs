@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { t } from '../shared/i18n.mjs';
+import { DiscordRateLimiter, rateLimitRouteKey } from './workbench/rate-limiter.mjs';
 
 const DEFAULT_BASE_URL = 'https://discord.com/api/v10/';
 const DEFAULT_FILE_UPLOAD_TIMEOUT_MS = 120_000;
@@ -11,8 +12,19 @@ function cleanString(value) {
 }
 
 function requestSignal(signal, timeoutMs) {
-  const timeout = AbortSignal.timeout(timeoutMs);
-  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+  // A referenced timer, not AbortSignal.timeout: an in-flight request that is
+  // waiting on its timeout must keep the process awake. An unref'd timer lets
+  // the event loop drain first, and the fetch would then never settle. The
+  // caller must dispose() it once the request settles so the referenced timer
+  // does not outlive the operation.
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+  }, timeoutMs);
+  return {
+    signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
+    dispose: () => clearTimeout(timer),
+  };
 }
 
 function abortReason(signal) {
@@ -104,12 +116,14 @@ export class DiscordApi {
   #fetch;
   #baseUrl;
   #fileUploadTimeoutMs;
+  #rateLimiter;
 
   constructor({
     token,
     fetchImpl = fetch,
     baseUrl = DEFAULT_BASE_URL,
     fileUploadTimeoutMs = DEFAULT_FILE_UPLOAD_TIMEOUT_MS,
+    rateLimiter = null,
   }) {
     if (!validDiscordToken(token)) throw new TypeError('Discord Bot Token is invalid');
     if (typeof fetchImpl !== 'function') throw new TypeError('DiscordApi requires fetch');
@@ -117,7 +131,10 @@ export class DiscordApi {
     this.#fetch = fetchImpl;
     this.#baseUrl = new URL(baseUrl);
     this.#fileUploadTimeoutMs = positiveTimeout(fileUploadTimeoutMs, 'fileUploadTimeoutMs');
+    this.#rateLimiter = rateLimiter ?? new DiscordRateLimiter();
   }
+
+  get rateLimiter() { return this.#rateLimiter; }
 
   getCurrentUser(options = {}) {
     return this.#request('users/@me', { ...options, method: 'GET' });
@@ -161,13 +178,20 @@ export class DiscordApi {
     );
   }
 
-  createMessage({ channelId, content, replyToMessageId, signal }) {
+  createMessage({
+    channelId, content, replyToMessageId, signal,
+    components, embeds, flags, allowedMentions, nonce,
+  }) {
     return this.#request(`channels/${snowflake(channelId, 'channel id')}/messages`, {
       method: 'POST',
       signal,
       body: {
         content,
-        allowed_mentions: { parse: [], replied_user: false },
+        allowed_mentions: allowedMentions ?? { parse: [], replied_user: false },
+        ...(components ? { components } : {}),
+        ...(embeds ? { embeds } : {}),
+        ...(Number.isInteger(flags) ? { flags } : {}),
+        ...(nonce ? { nonce, enforce_nonce: true } : {}),
         ...(replyToMessageId ? {
           message_reference: {
             message_id: snowflake(replyToMessageId, 'message id'),
@@ -209,11 +233,11 @@ export class DiscordApi {
     );
     const targetChannelId = snowflake(channelId, 'channel id');
     if (signal?.aborted) throw abortReason(signal);
-    const uploadSignal = requestSignal(signal, this.#fileUploadTimeoutMs);
+    const upload = requestSignal(signal, this.#fileUploadTimeoutMs);
     try {
       return await this.#request(`channels/${targetChannelId}/messages`, {
         method: 'POST',
-        signal: uploadSignal,
+        signal: upload.signal,
         timeoutMs: this.#fileUploadTimeoutMs,
         body: payload,
         multipart: true,
@@ -224,16 +248,25 @@ export class DiscordApi {
         throw discordArtifactProviderError(error);
       }
       throw uncertainDiscordDelivery(error);
+    } finally {
+      upload.dispose();
     }
   }
 
-  editMessage({ channelId, messageId, content, signal }) {
+  editMessage({
+    channelId, messageId, content, signal, components, embeds, allowedMentions,
+  }) {
     return this.#request(
       `channels/${snowflake(channelId, 'channel id')}/messages/${snowflake(messageId, 'message id')}`,
       {
         method: 'PATCH',
         signal,
-        body: { content, allowed_mentions: { parse: [], replied_user: false } },
+        body: {
+          content,
+          allowed_mentions: allowedMentions ?? { parse: [], replied_user: false },
+          ...(components ? { components } : {}),
+          ...(embeds ? { embeds } : {}),
+        },
       },
     );
   }
@@ -275,6 +308,113 @@ export class DiscordApi {
     );
   }
 
+  // ---- Guild workbench surface --------------------------------------------
+
+  getGuild({ guildId, signal } = {}) {
+    return this.#request(`guilds/${snowflake(guildId, 'guild id')}`, { method: 'GET', signal });
+  }
+
+  listGuildChannels({ guildId, signal } = {}) {
+    return this.#request(`guilds/${snowflake(guildId, 'guild id')}/channels`, {
+      method: 'GET',
+      signal,
+    });
+  }
+
+  createGuildChannel({
+    guildId, name, type = 0, parentId, topic, position, signal,
+  } = {}) {
+    const channelName = cleanString(name);
+    if (!channelName || [...channelName].length > 100) {
+      throw new TypeError('Discord channel name must contain 1-100 characters');
+    }
+    if (![0, 4, 5].includes(Number(type))) {
+      throw new TypeError('Discord channel type is not supported here');
+    }
+    return this.#request(`guilds/${snowflake(guildId, 'guild id')}/channels`, {
+      method: 'POST',
+      signal,
+      body: {
+        name: channelName,
+        type: Number(type),
+        ...(parentId ? { parent_id: snowflake(parentId, 'category id') } : {}),
+        ...(typeof topic === 'string' ? { topic: topic.slice(0, 1024) } : {}),
+        ...(Number.isInteger(position) ? { position } : {}),
+      },
+    });
+  }
+
+  modifyChannel({ channelId, name, parentId, topic, position, signal, nsfw } = {}) {
+    return this.#request(`channels/${snowflake(channelId, 'channel id')}`, {
+      method: 'PATCH',
+      signal,
+      body: {
+        ...(name === undefined ? {} : { name }),
+        ...(parentId === undefined
+          ? {}
+          : { parent_id: parentId === null ? null : snowflake(parentId, 'category id') }),
+        ...(topic === undefined
+          ? {}
+          : { topic: topic === null ? null : String(topic).slice(0, 1024) }),
+        ...(position === undefined ? {} : { position }),
+        ...(nsfw === undefined ? {} : { nsfw }),
+      },
+    });
+  }
+
+  deleteChannel({ channelId, signal } = {}) {
+    return this.#request(`channels/${snowflake(channelId, 'channel id')}`, {
+      method: 'DELETE',
+      signal,
+    });
+  }
+
+  /**
+   * Replace this application's command set for one Guild. Guild-scoped
+   * commands propagate immediately, which matters for a personal install.
+   */
+  bulkOverwriteGuildCommands({ applicationId, guildId, commands, signal } = {}) {
+    if (!Array.isArray(commands)) throw new TypeError('Discord commands must be an array');
+    return this.#request(
+      `applications/${snowflake(applicationId, 'application id')}`
+        + `/guilds/${snowflake(guildId, 'guild id')}/commands`,
+      { method: 'PUT', signal, body: commands },
+    );
+  }
+
+  createInteractionResponse({
+    interactionId, interactionToken, body, signal, withResponse = false,
+  } = {}) {
+    const token = cleanString(interactionToken);
+    if (!token) throw new TypeError('An interaction token is required');
+    const query = withResponse ? '?with_response=true' : '';
+    return this.#request(
+      `interactions/${snowflake(interactionId, 'interaction id')}/${token}/callback${query}`,
+      { method: 'POST', signal, body, retry: false },
+    );
+  }
+
+  /** Replace the message created by a deferred interaction response. */
+  editInteractionResponse({ applicationId, interactionToken, body, signal } = {}) {
+    const token = cleanString(interactionToken);
+    if (!token) throw new TypeError('An interaction token is required');
+    return this.#request(
+      `webhooks/${snowflake(applicationId, 'application id')}/${token}/messages/@original`,
+      { method: 'PATCH', signal, body },
+    );
+  }
+
+  createFollowupMessage({
+    applicationId, interactionToken, body, signal, wait = false,
+  } = {}) {
+    const token = cleanString(interactionToken);
+    if (!token) throw new TypeError('An interaction token is required');
+    return this.#request(
+      `webhooks/${snowflake(applicationId, 'application id')}/${token}${wait ? '?wait=true' : ''}`,
+      { method: 'POST', signal, body },
+    );
+  }
+
   async #request(path, {
     method,
     body,
@@ -284,6 +424,9 @@ export class DiscordApi {
     retry = true,
     multipart = false,
   }) {
+    const routeKey = rateLimitRouteKey(method, path);
+    await this.#rateLimiter.wait(routeKey, { signal });
+    const timeout = requestSignal(signal, timeoutMs);
     let response;
     try {
       response = await this.#fetch(new URL(path, this.#baseUrl), {
@@ -294,33 +437,44 @@ export class DiscordApi {
           'user-agent': 'DeepSeek-Harness-dsh-im (https://github.com/xmanrui/dsh-im, 1.1.0)',
         },
         ...(body === undefined ? {} : { body: multipart ? body : JSON.stringify(body) }),
-        signal: requestSignal(signal, timeoutMs),
+        signal: timeout.signal,
         redirect: 'error',
       });
     } catch (error) {
+      timeout.dispose();
       if (error?.name === 'AbortError' || error?.name === 'TimeoutError') throw error;
       throw new Error(`Discord ${method} transport failed`, { cause: error });
     }
 
     let parsed = null;
-    if (expectBody || response.status === 429 || !response.ok) {
-      try {
-        parsed = await response.json();
-      } catch (cause) {
-        if (expectBody) {
-          const error = new Error(`Discord ${method} returned invalid JSON`, { cause });
-          error.status = response?.status;
-          throw error;
+    try {
+      if (expectBody || response.status === 429 || !response.ok) {
+        try {
+          parsed = await response.json();
+        } catch (cause) {
+          if (expectBody) {
+            const error = new Error(`Discord ${method} returned invalid JSON`, { cause });
+            error.status = response?.status;
+            throw error;
+          }
         }
       }
+    } finally {
+      timeout.dispose();
     }
     if (response.status === 429 && retry) {
-      const retryAfterMs = Math.min(10_000, Math.max(50, Number(parsed?.retry_after) * 1_000 || 1_000));
-      await delay(retryAfterMs, signal);
+      // Schedule from the platform's own bucket state instead of a fixed
+      // backoff; the limiter also pauses every bucket on a global limit.
+      await this.#rateLimiter.penalize(routeKey, {
+        headers: response.headers,
+        body: parsed,
+        signal,
+      });
       return this.#request(path, {
         method, body, signal, timeoutMs, expectBody, retry: false, multipart,
       });
     }
+    this.#rateLimiter.observe(routeKey, response.headers, { status: response.status });
     if (!response.ok) {
       const error = new Error(cleanString(parsed?.message) ?? `Discord API failed with HTTP ${response.status}`);
       error.code = `discord-${response.status}`;
@@ -358,10 +512,16 @@ export async function inspectDiscordOwner(token, {
   ...options
 } = {}) {
   const api = new DiscordApi({ token, ...options });
-  const lookupSignal = requestSignal(signal, positiveTimeout(timeoutMs, 'owner lookup timeout'));
-  const request = { signal: lookupSignal, retry: false };
-  const application = await api.getCurrentApplication(request);
-  const bot = application?.bot ?? await api.getCurrentUser(request);
+  const lookup = requestSignal(signal, positiveTimeout(timeoutMs, 'owner lookup timeout'));
+  const request = { signal: lookup.signal, retry: false };
+  let application;
+  let bot;
+  try {
+    application = await api.getCurrentApplication(request);
+    bot = application?.bot ?? await api.getCurrentUser(request);
+  } finally {
+    lookup.dispose();
+  }
   if ((!application?.bot && bot?.bot !== true) || bot?.bot === false
     || snowflake(bot?.id, 'bot id') !== platformId) {
     throw new Error('Discord application does not belong to the configured bot');
@@ -374,6 +534,6 @@ export async function inspectDiscordOwner(token, {
   if (ownerUserId === platformId || (application?.owner?.bot === true && application?.team == null)) {
     throw new Error('Discord application owner is not a human identity');
   }
-  lookupSignal.throwIfAborted();
+  lookup.signal.throwIfAborted();
   return ownerUserId;
 }

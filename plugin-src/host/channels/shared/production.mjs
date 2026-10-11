@@ -163,6 +163,23 @@ export async function createTokenProductionController(ctx, config, internals, de
       const workspaceScope = createBotWorkspaceScope(harness, {
         botId, workspaces, state, agentPresetCatalog,
       });
+      // Optional channel hook for per-bot runtime options that need their own
+      // durable state (the Discord Guild workbench store is one). Failures here
+      // must not prevent the channel from starting, so the hook owns its own
+      // error handling contract and the caller only spreads the result.
+      const runtimeExtras = typeof definitions.runtimeOptionsForBot === 'function'
+        ? await definitions.runtimeOptionsForBot({
+          botId,
+          botConfig,
+          paths,
+          workspaces,
+          state,
+          harness: workspaceScope.harness,
+          logger,
+          configStore: observedConfigStore,
+          getController: () => controller,
+        })
+        : {};
       const persistTokens = typeof definitions.persistBotCredential === 'function'
         ? (tokens) => definitions.persistBotCredential({
           botId, config: botConfig, tokens, controller: controllerRef,
@@ -170,6 +187,7 @@ export async function createTokenProductionController(ctx, config, internals, de
         : null;
       return new ResolvedRuntime({
         ...channelRuntimeOptions,
+        ...runtimeExtras,
         config: botConfig,
         token,
         // The mailbox may authenticate with an OAuth pair instead of a password.
