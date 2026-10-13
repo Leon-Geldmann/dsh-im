@@ -1,5 +1,5 @@
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 
 /**
  * Persistent Guild-workbench state for one Discord bot.
@@ -47,6 +47,7 @@ function emptyState() {
   return {
     version: WORKBENCH_STORE_VERSION,
     guildId: null,
+    identity: null,
     projects: {},
     channels: {},
     sessions: {},
@@ -149,6 +150,14 @@ function normalizeState(value) {
   const state = emptyState();
   if (!value || typeof value !== 'object') return state;
   if (isSnowflake(value.guildId)) state.guildId = value.guildId;
+  if (value.identity && isSnowflake(value.identity.guildId)
+    && safeText(value.identity.botId, 256) && safeText(value.identity.instanceId, 256)) {
+    state.identity = {
+      guildId: value.identity.guildId,
+      botId: value.identity.botId,
+      instanceId: value.identity.instanceId,
+    };
+  }
   if (value.projects && typeof value.projects === 'object') {
     for (const entry of Object.values(value.projects)) {
       const project = normalizeProject(entry);
@@ -219,8 +228,27 @@ export class DiscordWorkbenchStore {
   }
 
   get guildId() { return this.#state.guildId; }
+  get inboxDirectory() { return join(dirname(this.#path), 'inbox'); }
+  get archiveDirectory() { return join(dirname(this.#path), 'archives'); }
 
   snapshot() { return structuredClone(this.#state); }
+
+  async bindIdentity({ guildId, botId, instanceId }) {
+    if (!isSnowflake(guildId) || !safeText(botId, 256) || !safeText(instanceId, 256)) {
+      throw new TypeError('Guild, bot and DSH instance identity are required');
+    }
+    const current = this.#state.identity;
+    if ((this.#state.guildId && this.#state.guildId !== guildId)
+      || (current && (current.guildId !== guildId || current.botId !== botId
+        || current.instanceId !== instanceId))) {
+      const error = new Error('The workbench belongs to a different Guild, bot or DSH instance.');
+      error.code = 'workbench-identity-conflict';
+      throw error;
+    }
+    this.#state.guildId = guildId;
+    this.#state.identity = { guildId, botId, instanceId };
+    await this.persist();
+  }
 
   /**
    * Bind this store to one Guild. A different Guild is refused so a copied
@@ -229,6 +257,11 @@ export class DiscordWorkbenchStore {
   async bindGuild(guildId, { rebind = false } = {}) {
     if (!isSnowflake(guildId)) throw new TypeError('A Discord Guild ID is required');
     const current = this.#state.guildId;
+    if (this.#state.identity && this.#state.identity.guildId !== guildId) {
+      throw Object.assign(new Error('The persisted workbench identity cannot be rebound.'), {
+        code: 'workbench-identity-conflict',
+      });
+    }
     if (current && current !== guildId && !rebind) {
       const error = new Error('This bot is already bound to another Discord server.');
       error.code = 'workbench-guild-conflict';
@@ -253,6 +286,13 @@ export class DiscordWorkbenchStore {
   async putProject(value) {
     const project = normalizeProject(value);
     if (!project) throw new TypeError('Invalid workbench project');
+    const current = this.project(project.projectId);
+    if (current && (current.workspacePath !== project.workspacePath
+      || current.categoryId !== project.categoryId) && this.listChannels(project.projectId).length > 0) {
+      throw Object.assign(new Error('The project already has fixed channels; its directory and category cannot change.'), {
+        code: 'workbench-project-conflict',
+      });
+    }
     const clash = this.projectForCategory(project.categoryId);
     if (clash && clash.projectId !== project.projectId) {
       const error = new Error('This Discord category is already bound to another project.');
@@ -329,11 +369,11 @@ export class DiscordWorkbenchStore {
 
   /**
    * Commit a channel -> Session binding. Rebinding an occupied channel is
-   * refused unless it is the same pair or the caller explicitly replaces the
-   * mapping after it was verified to be gone.
+   * refused unless it is the same pair. Even a missing Session keeps its
+   * original binding; opening a different Session requires a different channel.
    */
   async bindChannelSession(channelId, sessionId, {
-    title = null, projectId = null, at = new Date().toISOString(), replace = false,
+    title = null, projectId = null, at = new Date().toISOString(),
   } = {}) {
     const channel = this.channel(channelId);
     if (!channel) {
@@ -342,7 +382,7 @@ export class DiscordWorkbenchStore {
       throw error;
     }
     if (!cleanString(sessionId)) throw new TypeError('A Session ID is required');
-    if (channel.sessionId && channel.sessionId !== sessionId && !replace) {
+    if (channel.sessionId && channel.sessionId !== sessionId) {
       const error = new Error('The channel already holds a Session binding.');
       error.code = 'workbench-session-conflict';
       error.sessionId = channel.sessionId;
@@ -461,18 +501,24 @@ export class DiscordWorkbenchStore {
     if (!action) return { ok: false, reason: 'unknown', action: null };
     if (action.consumedAt !== null) return { ok: false, reason: 'consumed', action };
     if (action.expiresAt && now > action.expiresAt) return { ok: false, reason: 'expired', action };
-    if (action.operatorId && operatorId && action.operatorId !== operatorId) {
+    if (action.operatorId && action.operatorId !== operatorId) {
       return { ok: false, reason: 'operator', action };
     }
-    if (action.guildId && guildId && action.guildId !== guildId) {
+    if (action.guildId && action.guildId !== guildId) {
       return { ok: false, reason: 'scope', action };
     }
-    if (action.channelId && channelId && action.channelId !== channelId) {
+    if (action.channelId && action.channelId !== channelId) {
       return { ok: false, reason: 'scope', action };
     }
     action.consumedAt = now;
     void this.persist().catch(() => undefined);
     return { ok: true, reason: 'ok', action };
+  }
+
+  async claimAction(actionId, context = {}) {
+    const result = this.takeAction(actionId, context);
+    if (result.ok) await this.persist();
+    return result;
   }
 
   async pruneActions(now = Date.now(), { retainMs = 300_000 } = {}) {

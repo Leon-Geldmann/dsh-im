@@ -1,4 +1,6 @@
-import { resolve } from 'node:path';
+import { realpath } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 
 import { DiscordConfigStore } from '../../../../src/channels/discord/config-store.mjs';
 import { DiscordController } from '../../../../src/channels/discord/discord-controller.mjs';
@@ -21,17 +23,10 @@ export function createProductionController(ctx, config = {}, internals = {}) {
     Controller: DiscordController,
     Runtime: DiscordRuntime,
     runtimeOptionsForBot: async ({
-      botId, botConfig, paths, logger, configStore, getController, workspaces, state,
+      botId, botConfig, paths, configStore, getController, workspaces, state,
     }) => {
-      let workbench = null;
-      try {
-        workbench = normalizeWorkbenchConfig(botConfig?.workbench);
-      } catch (error) {
-        // An enabled-but-incomplete workbench block is reported and the bot
-        // keeps its legacy Discord behavior.
-        logger?.warn?.(`[${botId}] workbench configuration is unusable:`, error?.message ?? error);
-        return { workbench: null };
-      }
+      const workbench = normalizeWorkbenchConfig(botConfig?.workbench);
+      let store = null;
       const workbenchAdmin = {
         /**
          * Persist one workbench configuration patch. The caller decides when a
@@ -48,16 +43,20 @@ export function createProductionController(ctx, config = {}, internals = {}) {
           await getController()?.reconnectBot?.(botId);
         },
         /**
-         * Bind or clear a channel's Session sync. The workbench channel keeps
-         * its Session in workbench.json, so the delivery adapter needs the
-         * conversation key binding in the channel state store as well; it is
-         * written only while sync is on and removed when it is turned off.
+         * Sync controls proactive delivery only. Control commands always need
+         * the workbench's fixed Session in the conversation state store.
          */
         async setSessionSync({ channelId, sessionId, enabled }) {
           const targetId = `workbench-${channelId}`;
           const conversationKey = `group:${channelId}`;
+          const boundSessionId = store?.channel(String(channelId))?.sessionId;
+          if (!boundSessionId || boundSessionId !== sessionId) {
+            const error = new Error('Session sync requires the managed channel Session binding.');
+            error.code = 'workbench-session-conflict';
+            throw error;
+          }
+          await state.setSession(conversationKey, boundSessionId);
           if (!enabled) {
-            await state.clearSession(conversationKey);
             if (workspaces.deliveryTargetFor(botId, targetId)) {
               await workspaces.setDeliveryTargetSessionSync(botId, targetId, null);
             }
@@ -71,15 +70,18 @@ export function createProductionController(ctx, config = {}, internals = {}) {
               name: `工作台 ${channelId}`,
             });
           }
-          await state.setSession(conversationKey, sessionId);
           await workspaces.setDeliveryTargetSessionSync(botId, targetId, conversationKey);
           return { enabled: true };
         },
       };
       if (!workbench?.enabled) return { workbench, workbenchAdmin };
-      const store = await new DiscordWorkbenchStore(
+      store = await new DiscordWorkbenchStore(
         resolve(paths.bots, botId, 'workbench.json'),
       ).load();
+      const dshHome = await realpath(resolve(
+        config.dshHome ?? process.env.DSH_HOME ?? join(homedir(), '.dsh'),
+      ));
+      await store.bindIdentity({ guildId: workbench.guildId, botId, instanceId: `dsh-home:${dshHome}` });
       return { workbench, workbenchStore: store, workbenchAdmin };
     },
   });

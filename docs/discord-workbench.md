@@ -100,7 +100,7 @@ node scripts/configure-discord-workbench.mjs \
 | `/workbench status\|bind\|allow\|root` | 绑定服务器、维护白名单与项目根目录 |
 | `/project new\|bind\|list\|info` | 创建/绑定项目与分组，查看目录映射 |
 | `/session new\|open\|info\|history\|archive\|restore\|sync` | 新会话频道、绑定已有会话、历史、归档/恢复、双向同步 |
-| `/model` | 列出并切换当前会话模型 |
+| `/model` | 列出并切换当前会话模型及该模型支持的推理强度 |
 | `/task stop\|steer\|compact` | 停止、补充指令、压缩上下文 |
 
 命令在绑定 Guild 内即时生效（Guild 命令），不做全局注册。
@@ -116,8 +116,7 @@ node scripts/configure-discord-workbench.mjs \
 
 - DSH 需要补充信息且问题带选项时，频道会收到按钮卡片：点击即提交所选选项，卡片
   随即去掉按钮，后续点击返回"已失效"。
-- 多选问题需要累加选择与提交动作，当前明确降级为文字回答（问题文本照常列出选项），
-  不会做"点了没反应"的假按钮。
+- 1–25 个选项的多选问题使用原生下拉多选；单选选项较多时也使用下拉。无选项或超过组件限制时保留文字回答；文字补充遵循 DSH 问题语义。
 - 审批请求以「批准一次 / 拒绝」按钮呈现，沿用 DSH 的审批语义：只有发起该任务的
   操作者可以处理，先处理的一端（Web 或 Discord）生效；按钮只携带一次性令牌，
   过期、转发或已处理的点击都会返回真实状态。
@@ -134,12 +133,11 @@ node scripts/configure-discord-workbench.mjs \
 - **移动频道**：把受管频道拖到别的分组只改变显示位置。工作台以登记时的项目为准；
   需要换项目时请在目标分组用 `/session new`，或把频道移回原分组。
 - **归档（普通）**：`/session archive` 标记归档，频道保留、不再接受新任务。
-- **归档（深度）**：`/session archive deep:true` 需在收到确认按钮后执行，删除 Discord
-  频道但保留 Session 与恢复索引。
+- **归档（深度）**：`/session archive deep:true` 需点击确认按钮。先核实权限、任务状态，完整保存 DSH 历史、Discord 消息和附件，再删除频道；原 Session 与恢复索引保留。历史读取、附件保存或最终频道检查失败均不删除。
 - **恢复**：`/session restore <会话ID>` 在原项目重建频道并复用原 Session。
 - **删除频道/Category**：不会删除 DSH 历史或项目文件。
-- **空频道创建竞态**：`/session new` 先建频道再建会话；会话创建失败时频道保持登记，
-  下一条消息会重试建会话，不会出现"半成功无人管"的频道。
+- **空频道创建竞态**：`/session new` 与首条消息共用会话创建日志。已知创建成功但绑定失败时重试同一 Session 的绑定；创建结果不确定时保留记录并提示核对，不会重复创建。
+- 创建和恢复前检查服务器 500 个频道、Category 内 50 个频道的容量，接近上限时提示；平台 API 仍是最终依据。
 
 ## 7. 并发与限流
 
@@ -149,7 +147,9 @@ node scripts/configure-discord-workbench.mjs \
 - 停止/审批/补充指令等控制请求不排在任务队列后面。
 - Discord API 按响应头中的 Bucket、`Retry-After`、`X-RateLimit-*` 调度；全局 429
   会暂停所有请求，频道级 429 只暂停该路由。
-- 重复 Gateway 事件按消息 ID 去重；断线重连后继续跟踪原任务。
+- 重复 Gateway 事件按消息 ID 去重；断线重连后继续跟踪原请求 ID 的任务。4007/4009 会清除失效的 Gateway session 后重新 Identify。
+- 已提交但未确认结束的任务在进程重启或观察超时后继续占用并发容量；后续任务若无法安全进入会明确拒绝，确认原任务结束后再发送。
+- 任务实际获得执行名额时再次检查固定绑定、归档状态、Category 和项目真实路径，排队期间发生变化不会向旧目录提交。
 
 ## 8. 双向同步
 
@@ -186,7 +186,7 @@ node scripts/configure-discord-workbench.mjs \
 - 定制代码集中在 `src/channels/discord/workbench/**`、`scripts/configure-discord-workbench.mjs`
   与本文件；对共享层的改动均为**可选注入**，未开启工作台时行为与上游一致。
 - 回滚：把 `workbench.enabled` 置为 false（脚本 `--disable`）并重连 Bot 即可回到
-  旧 Thread 模式；`workbench.json` 可整体备份/删除，不影响 DSH 会话与项目文件。
+  旧 Thread 模式；恢复原模式前完整备份 `workbench.json`、`inbox/`、`archives/`；不要直接删除有未核实任务的工作台状态。DSH 会话与项目文件独立保留。
 
 ## 11. 已知限制
 
@@ -200,8 +200,7 @@ node scripts/configure-discord-workbench.mjs \
 
 ## 12. 验收清单
 
-1. `npm test` 无失败（允许基线中的 cancelled 计数）；`npm run build`、
-   `node scripts/verify-package.mjs` 通过。
+1. `npm run check` 退出码 0，测试无失败、无 cancelled；构建及包检查通过。
 2. 绑定 Guild 后，Bot 在该服务器可见工作台命令（`/status` 有响应）。
 3. 项目分组下新建频道 → 发一条消息 → 自动创建会话并回复；`/session info` 显示
    固定 Session。
@@ -214,3 +213,47 @@ node scripts/configure-discord-workbench.mjs \
 9. `/session archive deep:true` → 确认后频道消失，`/session restore` 能重建并复用
    原 Session。
 10. `/session sync action:on` 后，在 DSH 网页同一会话发消息/等回答 → 频道出现镜像。
+
+
+## 13. 持久恢复、附件与归档保存（2026-10-13）
+
+- `workbench.json` 的 `message-task` 日志分别记录 queued、submitting、running、completed、delivering、delivered，以及提交/投递不确定状态；保存 sessionId、promptRpcId、历史位置和回执。
+- 入站附件在权限、路由、目录校验后立即写入同目录的私有 `inbox/`，避免排队期间 CDN 链接失效。确定成功/失败路径清理缓存；不确定状态保留缓存以便核查，备份时一并保存。
+- 工作台任务由自己的日志恢复，不同时注册共享的 deferred delivery。普通渠道沿用旧路径。
+- 重启前尚未提交的排队消息提示核对后重发，先将原记录标为 cancelled，再尝试通知；通知结果不确定也不会继续占用归档阻塞状态；不会静默重放。提交不确定时查询原请求对应的历史，无法确认就继续保留，不猜测已执行/未执行。
+- 已识别的原 turn 仍运行时继续跟踪，已结束时补投最终文本。投递结果不明时不自动重发，提示在 DSH 查看。自动恢复不保证结果附件补投，原产物仍应在 DSH/项目目录查看。
+- 深度归档快照位于工作台状态同目录的 `archives/<channelId>-<uuid>/`：`manifest.json` 含 DSH 历史、Discord 消息和附件索引，附件用内部文件名存储（原文件名仅作为元数据）。目录 0700、文件 0600，完成写盘后才记为 saved。
+- 深度归档核实有效的查看频道、读取消息历史、管理频道权限；未完成/未核实任务会阻止删除。快照过程中频道出现新消息也会中止删除。归档期间请停止其他客户端/用户写入：Discord 没有“读取快照并条件删除”的原子 API，最后核查与删除之间仍有极短竞争窗口。
+- 普通归档及准备深度归档会停止工作台接收新任务，不修改 Discord 成员权限覆盖；成员仍可能发消息。保存失败会保留频道，可重试深度归档或恢复。
+- 恢复会核对 Discord 上的真实频道：确认不存在时重建；权限/网络不确定时保留绑定。已保存的新频道 ID 可继续登记，避免重复建频道。
+
+## 14. 定制版安装与交付边界
+
+仓库：`https://github.com/Leon-Geldmann/dsh-im`，分支 `feat/discord-guild-workbench`。
+本轮运行环境：Node 22.23.2、DSH 0.2.0-rc.2、插件源码版本 4.38.0。
+
+先在独立 DSH_HOME/Profile 验证，安装已构建 tarball：
+
+```bash
+# 使用本次交付的绝对 tarball 路径；此命令不会在本轮自动执行
+DSH_HOME=/absolute/path/to/dsh-discord-test dsh plugin --profile web add /absolute/path/to/dsh-im-workbench.tgz
+# 在同一个 DSH_HOME 配置测试 Bot、Guild、白名单与允许根目录后启动
+DSH_HOME=/absolute/path/to/dsh-discord-test dsh web --no-open
+```
+
+生产启用前备份 DSH Profile、插件包及完整 integrations 状态目录，在维护窗口按同样
+方式安装已验证包并重启。保留 tarball 和 SHA-256，升级定制版时从 Fork 的明确提交构建。
+不要通过原版 npm 安装/插件上游更新按钮覆盖该包；恢复原版前先禁用工作台并备份全部状态。
+本轮未替换生产插件、未修改生产配置、未发布 npm 或上游 PR。
+
+离线 Mock 测试不能证明真实 Discord/代理链路通过。当前未配置测试 Bot，真实端到端
+需要 Bot Token（仅写本机配置）、Guild ID、授权用户 ID 和测试项目根目录；按第 12 节
+清单验证，并增加：多选、推理强度、Web/Discord 审批竞争、长任务断线恢复、归档附件保存。
+
+## 15. 仍需注意的能力边界
+
+- 并发保护覆盖本工作台受管任务及其恢复记录，不是整个 DSH 实例的跨客户端全局调度锁；其他客户端在不同 Session 对同一目录启动任务仍需协调。
+- 提交结果不确定且宿主没有可关联历史时，系统保留记录和并发保护，不提供自动强制重放。需先人工核对 DSH，不能仅删除日志来尝试“解锁”。
+- 快照未保存 DSH 内部数据库或项目完整副本；删除频道不删除 DSH Session，项目文件另行备份。
+- 工作台设置页仍由脚本/原生命令提供；未增加图形化项目配置面板。
+- 参考本机 Hermes 的持久消息游标、断线恢复和网络重试边界，沿用本项目的 JSON 状态、DSH 请求身份和 Node 网络层；没有移植 Telegram 的专用 DNS fallback 或新增外部数据库。

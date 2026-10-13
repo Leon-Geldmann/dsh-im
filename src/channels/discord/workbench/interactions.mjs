@@ -79,6 +79,7 @@ export class DiscordInteractionHandler {
   /** Entry point for the Gateway INTERACTION_CREATE event. */
   async handle(interaction) {
     const type = Number(interaction?.type);
+    let helpers;
     try {
       if (type === INTERACTION_TYPE.PING) {
         await this.#api.createInteractionResponse({
@@ -93,7 +94,7 @@ export class DiscordInteractionHandler {
         INTERACTION_TYPE.MODAL_SUBMIT].includes(type)) {
         return;
       }
-      const helpers = this.#helpers(interaction);
+      helpers = this.#helpers(interaction);
       const guildId = interactionGuild(interaction);
       const operatorId = interactionUser(interaction);
       if (!guildId || guildId !== this.#workbench.guildId) {
@@ -105,6 +106,10 @@ export class DiscordInteractionHandler {
         return;
       }
       if (type === INTERACTION_TYPE.APPLICATION_COMMAND) {
+        if (!await this.#workbench.store.markProcessed(`interaction:${interaction.id}`)) {
+          await helpers.respond({ content: '这条命令已经接收，未重复执行。', ephemeral: true });
+          return;
+        }
         await this.#commands.executeApplicationCommand(interaction, helpers);
         return;
       }
@@ -113,11 +118,31 @@ export class DiscordInteractionHandler {
         await helpers.respond({ content: '无法识别的操作。', ephemeral: true });
         return;
       }
-      const taken = this.#workbench.store.takeAction(parsed.actionId, {
+      const stored = this.#workbench.store.action(parsed.actionId);
+      const channelId = String(interaction.channel_id ?? interaction?.message?.channel_id ?? '');
+      const modalSubmit = stored?.kind === 'steer-submit';
+      if (stored && (parsed.kind !== stored.kind
+        || modalSubmit !== (type === INTERACTION_TYPE.MODAL_SUBMIT)
+        || (type === INTERACTION_TYPE.MESSAGE_COMPONENT
+          && Number(interaction.data?.component_type) !== (['model', 'reasoning'].includes(stored.kind) ? 3 : 2)))) {
+        await helpers.respond({ content: ACTION_REFUSAL_TEXT.unknown, ephemeral: true });
+        return;
+      }
+      if (!channelId || (stored?.channelId && stored.channelId !== channelId)) {
+        await helpers.respond({ content: ACTION_REFUSAL_TEXT.scope, ephemeral: true });
+        return;
+      }
+      const channel = this.#workbench.store.channel(channelId);
+      if (stored && !['refresh', 'new-session'].includes(stored.kind)
+        && (!channel || stored.sessionId !== channel.sessionId)) {
+        await helpers.respond({ content: ACTION_REFUSAL_TEXT.unknown, ephemeral: true });
+        return;
+      }
+      const taken = await this.#workbench.store.claimAction(parsed.actionId, {
         now: this.#now(),
         operatorId,
         guildId,
-        channelId: String(interaction.channel_id ?? interaction?.message?.channel_id ?? ''),
+        channelId,
       });
       if (!taken.ok) {
         await helpers.respond({
@@ -139,8 +164,11 @@ export class DiscordInteractionHandler {
     } catch (error) {
       this.#logger.error?.('[dsh-im:discord] interaction handling failed:', error);
       try {
-        const helpers = this.#helpers(interaction);
-        await helpers.respond({ content: '操作失败，请稍后重试。', ephemeral: true });
+        helpers ??= this.#helpers(interaction);
+        const failure = { content: '操作失败，请稍后重试。', ephemeral: true };
+        if (helpers.deferred) await helpers.editOriginal(failure);
+        else if (helpers.responded) await helpers.followup(failure);
+        else await helpers.respond(failure);
       } catch (replyError) {
         this.#logger.warn?.('[dsh-im:discord] interaction failure reply was not delivered:', replyError);
       }

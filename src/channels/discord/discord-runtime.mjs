@@ -10,6 +10,9 @@ import { createDiscordBridgeStatus, DiscordHarnessBridge } from './discord-bridg
 import { DiscordGuildWorkbench } from './workbench/guild-workbench.mjs';
 import { WorkbenchCommands, WORKBENCH_COMMANDS } from './workbench/commands.mjs';
 import { DiscordInteractionHandler } from './workbench/interactions.mjs';
+import { WorkbenchTaskJournal } from './workbench/task-journal.mjs';
+import { cacheWorkbenchInputs } from './workbench/input-cache.mjs';
+import { verifyExistingDirectory } from './workbench/project-registry.mjs';
 
 const DISCORD_GATEWAY_INTENTS = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15);
 const THREAD_RECOVERY_TIMEOUT_MS = 5_000;
@@ -547,7 +550,7 @@ export class DiscordBotClient {
    */
   async #sendButtonCard(target, { text, markup }) {
     const rows = Array.isArray(markup?.rows) ? markup.rows : [];
-    const components = rows
+    const components = markup?.components ?? rows
       .map((row) => ({
         type: 1,
         components: (Array.isArray(row) ? row : [])
@@ -585,7 +588,7 @@ export class DiscordBotClient {
   /** Replace a card's buttons with the given set (an empty set retires them). */
   #updateButtonCard(target, messageId, { markup }) {
     const rows = Array.isArray(markup?.rows) ? markup.rows : [];
-    const components = rows
+    const components = markup?.components ?? rows
       .map((row) => ({
         type: 1,
         components: (Array.isArray(row) ? row : []).slice(0, 5).map((button) => ({
@@ -621,6 +624,16 @@ export class DiscordBotClient {
     const interactionId = callback.interactionId ?? _callbackQueryId;
     const interactionToken = callback.interactionToken;
     if (!interactionId || !interactionToken) return;
+    if (callback.deferred) {
+      await this.#api.editInteractionResponse({
+        applicationId: callback.applicationId,
+        interactionToken,
+        body: { content: String(text ?? '').slice(0, 1_900),
+          allowed_mentions: { parse: [], replied_user: false } },
+        signal: this.#signal,
+      });
+      return;
+    }
     await this.#api.createInteractionResponse({
       interactionId,
       interactionToken,
@@ -688,6 +701,11 @@ export class DiscordRuntime {
   #commands = null;
   #interactions = null;
   #commandsRegisteredAt = null;
+  #taskJournal = null;
+  #liveWorkbenchMessages = new Set();
+  #recoveryTimer = null;
+  #recovering = false;
+  #pendingHandlers = new Set();
 
   constructor({
     config,
@@ -729,17 +747,17 @@ export class DiscordRuntime {
           config: workbench,
           store: workbenchStore,
           harness,
+          state,
           ownerUserId: config.ownerUserId ?? null,
           logger,
         })
         : null;
     } catch (error) {
-      // A damaged workbench configuration must not take the whole bot down;
-      // the legacy Discord behavior stays available and /status reports it.
-      this.#workbench = null;
-      this.#workbenchError = error?.message ?? String(error);
-      logger.warn?.('[dsh-im:discord] workbench is not available:', this.#workbenchError);
+      throw error;
     }
+    if (this.#workbench) this.#taskJournal = new WorkbenchTaskJournal({
+      store: this.#workbench.store, harness,
+    });
   }
 
   get workbench() { return this.#workbench; }
@@ -793,6 +811,7 @@ export class DiscordRuntime {
     if (!actor) return false;
     return this.#bridge.presentSessionSyncApproval(interaction, {
       key: options.key, actor, validate: options.validate,
+      target: { channelId },
       send: (text) => this.sendProactiveText(target, text),
     }, options);
   }
@@ -875,6 +894,7 @@ export class DiscordRuntime {
           harness: this.#harness,
           admin: this.#workbenchAdmin,
           queue: this.#workbench.queue,
+          controlOwner: this.#bridge,
           logger: this.#logger,
         });
         this.#interactions = new DiscordInteractionHandler({
@@ -990,8 +1010,9 @@ export class DiscordRuntime {
           this.#sessionId = packet.d?.session_id ?? null;
           this.#resumeUrl = packet.d?.resume_gateway_url ?? null;
           markReady();
+          void this.#trackHandler(this.#recoverWorkbenchTasks());
           if (this.#workbench) {
-            void this.#registerGuildCommands(this.#api, this.#abortController?.signal).catch((error) => {
+            void this.#trackHandler(this.#registerGuildCommands(this.#api, this.#abortController?.signal)).catch((error) => {
               this.#logger.warn?.(
                 '[dsh-im:discord] Guild command registration failed:',
                 extractConnectionEvidence(error).details,
@@ -1000,6 +1021,7 @@ export class DiscordRuntime {
           }
         } else if (packet.t === 'RESUMED') {
           markReady();
+          void this.#trackHandler(this.#recoverWorkbenchTasks());
         } else if (packet.t === 'GUILD_CREATE') {
           for (const channel of [...(packet.d?.channels ?? []), ...(packet.d?.threads ?? [])]) {
             this.#rememberChannel(channel);
@@ -1008,13 +1030,21 @@ export class DiscordRuntime {
           || packet.t === 'THREAD_CREATE' || packet.t === 'THREAD_UPDATE') {
           this.#rememberChannel(packet.d);
         } else if (packet.t === 'CHANNEL_DELETE' || packet.t === 'THREAD_DELETE') {
-          if (packet.d?.id) this.#channels.delete(String(packet.d.id));
+          if (packet.d?.id) {
+            const channelId = String(packet.d.id);
+            this.#channels.delete(channelId);
+            if (this.#workbench?.store.channel(channelId)) {
+              void this.#trackHandler(this.#workbench.store.detachChannel(channelId)).catch((error) => {
+                this.#logger.error?.('[dsh-im:discord] channel deletion could not be persisted:', error?.code);
+              });
+            }
+          }
         } else if (packet.t === 'THREAD_LIST_SYNC') {
           for (const channel of packet.d?.threads ?? []) this.#rememberChannel(channel);
         } else if (packet.t === 'MESSAGE_CREATE') {
           const bridge = this.#bridge;
           if (packet.d && bridge) {
-            void this.#acceptMessage(packet.d, bridge).catch((error) => {
+            void this.#trackHandler(this.#acceptMessage(packet.d, bridge)).catch((error) => {
               if (generation !== this.#generation || this.#stopped) return;
               this.#logger.error?.(
                 `[dsh-im:discord] bot ${this.#config.botId} message handling failed:`,
@@ -1024,8 +1054,8 @@ export class DiscordRuntime {
           }
         } else if (packet.t === 'INTERACTION_CREATE') {
           const interactions = this.#interactions;
-          if (packet.d && interactions) {
-            void this.#handleInteractionEvent(packet.d, interactions).catch((error) => {
+          if (packet.d && this.#bridge) {
+            void this.#trackHandler(this.#handleInteractionEvent(packet.d, interactions)).catch((error) => {
               this.#logger.error?.(
                 `[dsh-im:discord] bot ${this.#config.botId} interaction handling failed:`,
                 extractConnectionEvidence(error).details,
@@ -1042,7 +1072,13 @@ export class DiscordRuntime {
           if (!settled) reject(new DOMException('Stopped', 'AbortError'));
           return;
         }
-        const error = gatewayCloseError(Number(event.code) || 0);
+        const closeCode = Number(event.code) || 0;
+        if (closeCode === 4007 || closeCode === 4009) {
+          this.#sessionId = null;
+          this.#resumeUrl = null;
+          this.#sequence = null;
+        }
+        const error = gatewayCloseError(closeCode);
         this.#status.ready = false;
         this.#status.connectionState = 'connecting';
         this.#status.error = this.#diagnostics.report(error, { operation: 'connection.monitor', botId: this.#config?.botId, automatic: true }).publicError;
@@ -1078,7 +1114,7 @@ export class DiscordRuntime {
    */
   async #handleInteractionEvent(interaction, interactions) {
     if (await this.#handleBridgeCardPress(interaction)) return;
-    await interactions.handle(interaction);
+    await interactions?.handle(interaction);
   }
 
   async #handleBridgeCardPress(interaction) {
@@ -1089,6 +1125,19 @@ export class DiscordRuntime {
     const senderId = String(interaction?.member?.user?.id ?? interaction?.user?.id ?? '');
     const channelId = String(interaction?.channel_id ?? '');
     if (!senderId || !channelId) return false;
+    if (this.#workbench && (String(interaction.guild_id ?? '') !== this.#workbench.guildId
+      || !this.#workbench.isOperator(senderId) || !this.#workbench.store.channel(channelId))) {
+      await this.#api.createInteractionResponse({
+        interactionId: interaction.id, interactionToken: interaction.token,
+        body: { type: 4, data: { content: '这条操作已失效或不在你的访问范围内。', flags: 64,
+          allowed_mentions: { parse: [], replied_user: false } } },
+      });
+      return true;
+    }
+    await this.#api.createInteractionResponse({
+      interactionId: interaction.id, interactionToken: interaction.token,
+      body: { type: 5, data: { flags: 64 } },
+    });
     const callback = {
       conversationId: channelId,
       senderId,
@@ -1096,6 +1145,9 @@ export class DiscordRuntime {
       kind: interaction?.guild_id ? 'group' : 'direct',
       senderIsBot: false,
       data: customId,
+      values: interaction?.data?.values,
+      deferred: true,
+      applicationId: String(interaction.application_id ?? this.#config.platformId),
       callbackQueryId: interaction.id,
       interactionId: interaction.id,
       interactionToken: interaction.token,
@@ -1132,6 +1184,8 @@ export class DiscordRuntime {
     // and a managed channel keeps one fixed Session without threads or
     // mentions. Everything the workbench does not claim keeps legacy behavior.
     if (this.#workbench && message.guild_id) {
+      if (String(message.guild_id) !== this.#workbench.guildId
+        || !this.#workbench.isOperator(preflight.senderId) || message.webhook_id) return;
       const channelId = String(message.channel_id ?? preflight.conversationId);
       let channel = this.#channels.get(channelId) ?? null;
       if (!channel && typeof this.#api?.getChannel === 'function') {
@@ -1143,6 +1197,17 @@ export class DiscordRuntime {
       }
       const decision = this.#workbench.classifyChannelMessage(message, { channel });
       if (decision.managed) {
+        const registered = this.#workbench.store.channel(channelId);
+        const project = registered ? this.#workbench.store.project(registered.projectId) : null;
+        if (registered && (!channel || String(channel.parent_id ?? '') !== project?.categoryId)) {
+          await this.#workbench.store.noteChannelError(channelId, 'Discord category does not match the registered project');
+          await this.#api.createMessage({
+            channelId,
+            content: '频道分组与原项目不一致，本次消息未提交。请移回原分组，或在目标项目执行 /session new。',
+            signal: this.#abortController?.signal,
+          });
+          return;
+        }
         if (decision.register) {
           await this.#workbench.registerChannel({
             channelId: decision.channelId,
@@ -1150,19 +1215,88 @@ export class DiscordRuntime {
             title: typeof channel?.name === 'string' ? channel.name : null,
           });
         }
-        await bridge.accept(withWorkbenchRoute(preflight, decision.channelId), {
-          contextSnapshot: captureContextEnhancement(this.#contextEnhancement, 'group'),
-          busyMessageMode: this.#harness.currentBusyMessageMode?.() ?? 'queue',
-          accessDecision: { allowed: true, reason: 'workbench-operator' },
+        const checkProjectPath = async () => {
+          const binding = this.#workbench.store.channel(channelId);
+          const project = binding && this.#workbench.store.project(binding.projectId);
+          await verifyExistingDirectory(project?.workspacePath, this.#workbench.config.projectRoots);
+        };
+        try { await checkProjectPath(); }
+        catch {
+          await this.#api.createMessage({ channelId, content: '项目目录无法确认或已超出允许根目录，本次消息未提交。请检查 /project info。', signal: this.#abortController?.signal });
+          return;
+        }
+        const accepted = await this.#taskJournal.accept({
+          messageId, channelId, operatorId: preflight.senderId,
+          sessionId: this.#workbench.store.channel(channelId)?.sessionId ?? null,
         });
+        if (!accepted.accepted) return;
+        this.#liveWorkbenchMessages.add(messageId);
+        let cached;
+        try {
+          if (this.#stopped) throw new DOMException('Stopped', 'AbortError');
+          await this.#workbench.prepareChannel(channelId);
+          const imageLimits = preflight.images.length > 0
+            ? await this.#harness.getImageInputLimits?.() : {};
+          cached = await cacheWorkbenchInputs(withWorkbenchRoute(preflight, channelId), {
+            root: this.#workbench.store.inboxDirectory, messageId,
+            signal: this.#abortController?.signal, imageLimits,
+          });
+          await this.#taskJournal.update(messageId, 'queued', { attachments: cached.attachments });
+          await bridge.accept({ ...cached.message,
+            validateWorkbenchRoute: async () => {
+              await checkProjectPath();
+              const current = await this.#api.getChannel({ channelId, signal: this.#abortController?.signal });
+              const binding = this.#workbench.store.channel(channelId);
+              const project = binding && this.#workbench.store.project(binding.projectId);
+              if (!project || String(current?.parent_id ?? '') !== project.categoryId
+                || !this.#workbench.isOperator(preflight.senderId)) {
+                throw Object.assign(new Error('Queued channel context changed'), { code: 'workbench-session-unverified' });
+              }
+            },
+            onPromptState: this.#taskJournal.promptLifecycle(messageId),
+            onTaskState: async (state, facts) => {
+              const current = this.#workbench.store.operation(`message-${messageId}`);
+              if (state === 'error') {
+                if (current?.state === 'delivering') {
+                  await this.#taskJournal.update(messageId, 'delivery-unknown', facts);
+                } else if (current?.state === 'queued') {
+                  await this.#taskJournal.update(messageId, 'failed', facts);
+                }
+                return;
+              }
+              await this.#taskJournal.update(messageId, state, facts);
+            },
+          }, {
+            contextSnapshot: captureContextEnhancement(this.#contextEnhancement, 'group'),
+            busyMessageMode: this.#harness.currentBusyMessageMode?.() ?? 'queue',
+            accessDecision: { allowed: true, reason: 'workbench-operator' },
+          });
+          const current = this.#workbench.store.operation(`message-${messageId}`);
+          if (current?.state === 'queued') await this.#taskJournal.update(messageId, 'delivered');
+        } catch (error) {
+          const current = this.#workbench.store.operation(`message-${messageId}`);
+          if (current?.state === 'queued') await this.#taskJournal.update(messageId, 'failed', {
+            errorCode: error?.code ?? 'workbench-input-failed',
+          });
+          if (!this.#stopped) await this.#api.createMessage({ channelId,
+            content: '本次消息未能准备完成，请检查 /status 后重试。',
+            signal: this.#abortController?.signal,
+          }).catch(() => undefined);
+          throw error;
+        } finally {
+          const finalState = this.#workbench.store.operation(`message-${messageId}`)?.state;
+          if (cached && ['delivered', 'failed', 'cancelled'].includes(finalState)) {
+            await cached.cleanup().catch(() => this.#logger.warn?.('[dsh-im:discord] input cache cleanup deferred'));
+          }
+          this.#liveWorkbenchMessages.delete(messageId);
+          void this.#trackHandler(this.#recoverWorkbenchTasks());
+        }
         return;
       }
-      // A non-operator never triggers a task anywhere in the bound Guild, not
-      // even through the legacy mention/thread path. An operator's message in
-      // an unmapped channel keeps the legacy behavior.
-      if (String(message.guild_id) === this.#workbench.guildId
-        && decision.reason === 'not-operator') return;
+      return;
     }
+
+    if (this.#workbench) return;
 
     let accessDecision;
     if (preflight?.kind === 'group' && preflight.addressed === true
@@ -1214,6 +1348,63 @@ export class DiscordRuntime {
         await this.#state.markSeen(messageId);
       }
       throw error;
+    }
+  }
+
+  async #recoverWorkbenchTasks() {
+    if (!this.#taskJournal || this.#stopped || !this.#status.ready || this.#recovering) return;
+    this.#recovering = true;
+    if (this.#recoveryTimer !== null) clearTimeout(this.#recoveryTimer);
+    this.#recoveryTimer = null;
+    let trackPending = false;
+    try {
+      const recovered = await this.#taskJournal.recover({
+        signal: this.#abortController?.signal, excludeMessageIds: this.#liveWorkbenchMessages,
+      });
+      for (const task of recovered) {
+        if (this.#stopped) break;
+        const binding = this.#workbench.store.channel(task.channelId);
+        if (!binding || !this.#workbench.isOperator(task.operatorId)
+          || (task.sessionId && binding.sessionId !== task.sessionId)) continue;
+        if (['running', 'submission-unknown'].includes(task.status)) trackPending = true;
+        if (task.status === 'running') continue;
+        const entry = this.#workbench.store.operation(task.operationId);
+        // This task is known not to have been submitted. Its terminal state
+        // must not depend on whether a Discord notice has an uncertain result.
+        if (task.status === 'queued') await this.#taskJournal.update(task.messageId, 'cancelled');
+        if (entry?.payload.noticeState === task.status || entry?.payload.noticeState === `sending-${task.status}`) continue;
+        const project = this.#workbench.store.project(binding.projectId);
+        const channel = await this.#api.getChannel({ channelId: task.channelId,
+          signal: this.#abortController?.signal });
+        if (String(channel?.parent_id ?? '') !== project?.categoryId) continue;
+        const link = `https://discord.com/channels/${this.#workbench.guildId}/${task.channelId}/${task.messageId}`;
+        const text = task.status === 'completed' ? task.text || '后台任务已完成，没有文本回复。'
+          : task.status === 'queued' ? `工作台已重启，这条排队消息尚未提交。请核对后重新发送：${link}`
+          : task.status === 'delivery-unknown' ? `任务结果的投递状态暂时无法确认，已保留结果且未自动重发。请在 DSH 查看会话 ${task.sessionId}。`
+          : task.status === 'interrupted' ? `DSH 中的原任务已中断，未重放消息：${link}`
+          : `原消息是否提交成功暂时无法确认，未自动重放。请在 DSH 核对会话 ${task.sessionId ?? ''}：${link}`;
+        await this.#taskJournal.update(task.messageId,
+          task.status === 'completed' ? 'delivering' : task.status === 'queued' ? 'cancelled' : task.status,
+          { text: task.text ?? undefined, noticeState: `sending-${task.status}` });
+        try {
+          const receipt = await this.sendProactiveText({ kind: 'channel', route: { channelId: task.channelId } }, text);
+          await this.#taskJournal.update(task.messageId,
+            task.status === 'completed' ? 'delivered' : task.status === 'queued' ? 'cancelled' : task.status,
+            { noticeState: task.status, deliveryMessageIds: receipt?.providerMessageIds ?? [] });
+        } catch (error) {
+          if (task.status === 'completed') await this.#taskJournal.update(task.messageId, 'delivery-unknown');
+          throw error;
+        }
+      }
+    } catch (error) {
+      if (!this.#stopped) this.#logger.warn?.('[dsh-im:discord] workbench recovery requires another check:', error?.code ?? 'history-unavailable');
+      trackPending = true;
+    } finally {
+      this.#recovering = false;
+      if (trackPending && !this.#stopped) {
+        this.#recoveryTimer = setTimeout(() => { void this.#trackHandler(this.#recoverWorkbenchTasks()); }, 30_000);
+        this.#recoveryTimer.unref?.();
+      }
     }
   }
 
@@ -1270,29 +1461,50 @@ export class DiscordRuntime {
     this.#reconnectTimer?.unref?.();
   }
 
+  #trackHandler(pending) {
+    this.#pendingHandlers.add(pending);
+    const remove = () => this.#pendingHandlers.delete(pending);
+    pending.then(remove, remove);
+    return pending;
+  }
+
   async stop() {
     this.#stopped = true;
     this.#generation += 1;
     this.#abortController?.abort();
-    this.#abortController = null;
     if (this.#reconnectTimer !== null) clearTimeout(this.#reconnectTimer);
     this.#reconnectTimer = null;
+    if (this.#recoveryTimer !== null) clearTimeout(this.#recoveryTimer);
+    this.#recoveryTimer = null;
     this.#clearHeartbeat();
     const socket = this.#socket;
     const bridge = this.#bridge;
     this.#socket = null;
     this.#bridge = null;
-    this.#api = null;
     this.#routing.clear();
     try {
       if (socket && socket.readyState < 2) socket.close(1000, 'Plugin stopped');
     } catch (error) {
       this.#logger.warn?.(`[dsh-im:discord] bot ${this.#config.botId} failed to close Gateway:`, extractConnectionEvidence(error).details);
     }
-    await Promise.race([
-      bridge?.waitForIdle() ?? Promise.resolve(),
-      new Promise((resolve) => setTimeout(resolve, 2_000)),
-    ]);
+    let shutdownTimer;
+    try {
+      await Promise.race([
+        (async () => {
+          await bridge?.waitForIdle();
+          // Handlers also perform admission/checkpoint/cache work outside the
+          // bridge. Drain that work before releasing their API and signal.
+          while (this.#pendingHandlers.size > 0) {
+            await Promise.allSettled([...this.#pendingHandlers]);
+          }
+        })(),
+        new Promise((resolve) => { shutdownTimer = setTimeout(resolve, 2_000); }),
+      ]);
+    } finally {
+      clearTimeout(shutdownTimer);
+      this.#api = null;
+      this.#abortController = null;
+    }
     this.#status.ready = false;
     this.#status.connectionState = 'idle';
     return this.status;

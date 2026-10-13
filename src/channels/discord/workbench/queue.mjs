@@ -19,6 +19,7 @@ class Semaphore {
 
   get active() { return this.#active; }
   get waiting() { return this.#waiters.length; }
+  get limit() { return this.#limit; }
 
   setLimit(limit) {
     this.#limit = Math.max(1, limit);
@@ -53,10 +54,13 @@ export class WorkbenchQueue {
   #chains = new Map();
   #pending = new Map();
   #closed = false;
+  #reservations;
+  #activeSessions = new Set();
 
-  constructor({ maxConcurrentTasks = 1, projectConcurrency = 1 } = {}) {
+  constructor({ maxConcurrentTasks = 1, projectConcurrency = 1, reservations = () => [] } = {}) {
     this.#global = new Semaphore(maxConcurrentTasks);
     this.#projectLimit = projectConcurrency;
+    this.#reservations = reservations;
   }
 
   #project(projectId) {
@@ -97,17 +101,30 @@ export class WorkbenchQueue {
           error.code = 'workbench-queue-closed';
           throw error;
         }
-        await this.#global.acquire();
         const project = projectId ? this.#project(String(projectId)) : null;
+        if (project) await project.acquire();
         try {
-          if (project) await project.acquire();
+          await this.#global.acquire();
           try {
-            return await task();
+            if (this.#closed) {
+              throw Object.assign(new Error('The workbench queue is closed'), {
+                code: 'workbench-queue-closed',
+              });
+            }
+            const external = this.#reservations().filter((entry) => !this.#activeSessions.has(entry.sessionId));
+            if (external.some((entry) => entry.sessionId === sessionKey)
+              || this.#global.active + external.length > this.#global.limit
+              || (project && project.active + external.filter((entry) => entry.projectId === projectId).length > project.limit)) {
+              throw Object.assign(new Error('Accepted work still holds workbench capacity'), { code: 'workbench-task-unresolved' });
+            }
+            if (sessionKey) this.#activeSessions.add(sessionKey);
+            try { return await task(); }
+            finally { if (sessionKey) this.#activeSessions.delete(sessionKey); }
           } finally {
-            project?.release();
+            this.#global.release();
           }
         } finally {
-          this.#global.release();
+          project?.release();
         }
       })
       .finally(() => {

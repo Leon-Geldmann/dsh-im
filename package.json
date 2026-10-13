@@ -61,12 +61,14 @@
     "scripts/verify-lan-management.mjs",
     "scripts/verify-model-setting.mjs",
     "scripts/verify-package.mjs",
+    "scripts/configure-discord-workbench.mjs",
     "scripts/verify-session-channel-logos.mjs",
     "scripts/verify-session-title-prefix.mjs",
     "src",
     "PROACTIVE_DELIVERY.md",
     "PROACTIVE_DELIVERY.en.md",
     "docs/client-integration.md",
+    "docs/discord-workbench.md",
     "LICENSE",
     "README.md",
     "README.en.md",
@@ -98,7 +100,7 @@
   },
   "scripts": {
     "build": "node plugin-src/client/build.mjs && node plugin-src/host/build.mjs",
-    "test": "node --test test/*.test.mjs test/channels/*/*.test.mjs",
+    "test": "node --import ./test/setup.mjs --test --test-timeout=60000 test/*.test.mjs test/channels/*/*.test.mjs",
     "check": "npm run build && npm test && node scripts/verify-package.mjs"
   },
   "engines": {

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, rename, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -74,17 +74,23 @@ async function fixture(t, {
   sessionExists = async () => true,
   askAnswer = async (sessionId, text) => `answer:${text}`,
   allowedUserIds = [OPERATOR_ID],
-  projectRoots = ['/srv/projects'],
+  projectRoots = null,
 } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-workbench-runtime-'));
-  t.after(() => rm(directory, { recursive: true, force: true }));
+  let runtime;
+  t.after(async () => {
+    await runtime?.stop();
+    await rm(directory, { recursive: true, force: true });
+  });
+  const workspace = join(directory, 'projects', 'alpha');
+  await mkdir(workspace, { recursive: true });
   const store = await new DiscordWorkbenchStore(join(directory, 'workbench.json')).load();
   await store.bindGuild(GUILD_ID);
   await store.putProject({
     projectId: 'alpha',
     name: 'Alpha',
     categoryId: CATEGORY_ID,
-    workspacePath: '/srv/projects/alpha',
+    workspacePath: workspace,
   });
 
   const asks = [];
@@ -167,7 +173,7 @@ async function fixture(t, {
     async unmarkSeen(messageId) { seen.delete(messageId); return true; },
   };
 
-  const runtime = new DiscordRuntime({
+  runtime = new DiscordRuntime({
     config: {
       botId: 'discord_test',
       platformId: BOT_ID,
@@ -181,7 +187,7 @@ async function fixture(t, {
       enabled: true,
       guildId: GUILD_ID,
       allowedUserIds,
-      projectRoots,
+      projectRoots: projectRoots ?? [join(directory, 'projects')],
       maxConcurrentTasks: 1,
       projectConcurrency: 1,
     },
@@ -227,9 +233,13 @@ async function fixture(t, {
   const send = (payload) => socket.emit('message', {
     data: JSON.stringify({ op: 0, t: 'MESSAGE_CREATE', s: 3, d: payload }),
   });
+  const event = (type, payload) => socket.emit('message', {
+    data: JSON.stringify({ op: 0, t: type, s: 4, d: payload }),
+  });
 
   return {
-    runtime, store, asks, deliveries, threadStarts, created, message, send,
+    runtime, store, workspace, asks, deliveries, threadStarts, created, message, send, event,
+    get socket() { return socket; },
     async close() { await runtime.stop(); },
   };
 }
@@ -265,7 +275,7 @@ test('the first authorized message lazily registers a mapped channel and creates
   f.send(f.message('hello', { id: '111111111111111111' }));
   await eventually(() => f.asks.length === 1);
   assert.equal(f.created.length, 1);
-  assert.equal(f.created[0].workspace, '/srv/projects/alpha');
+  assert.equal(f.created[0].workspace, f.workspace);
   const channel = f.store.channel(CHANNEL_ID);
   assert.equal(channel.projectId, 'alpha');
   assert.equal(channel.sessionId, 'session-1');
@@ -347,7 +357,18 @@ test('token /new in a managed channel is refused instead of silently rebinding',
   assert.equal(f.store.channel(CHANNEL_ID).sessionId, 'session-fixed');
 });
 
-test('an unmapped channel in the bound guild keeps the legacy mention/thread path', async (t) => {
+test('a typed preset command cannot bypass the workbench guard through a fast runner', async (t) => {
+  const f = await fixture(t);
+  t.after(() => f.close());
+  await f.store.registerChannel({ channelId: CHANNEL_ID, projectId: 'alpha' });
+  await f.store.bindChannelSession(CHANNEL_ID, 'session-fixed');
+  f.send(f.message('/preset another', { id: '111111111111111162' }));
+  await eventually(() => f.deliveries.length > 0);
+  assert.match(f.deliveries[0].content, /全局默认/u);
+  assert.equal(f.asks.length, 0);
+});
+
+test('an unmapped channel in the workbench guild cannot create a legacy thread', async (t) => {
   const f = await fixture(t, {
     channels: [
       { id: CHANNEL_ID, type: 0, parent_id: CATEGORY_ID, name: 'alpha' },
@@ -360,8 +381,35 @@ test('an unmapped channel in the bound guild keeps the legacy mention/thread pat
     channelId: OTHER_CHANNEL_ID,
     mentions: [{ id: BOT_ID }],
   }));
-  await eventually(() => f.threadStarts.length === 1);
-  assert.equal(f.threadStarts[0].channelId, OTHER_CHANNEL_ID);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(f.threadStarts.length, 0);
+  assert.equal(f.asks.length, 0);
+});
+
+test('a moved managed channel refuses execution until returned to its project', async (t) => {
+  const f = await fixture(t);
+  t.after(() => f.close());
+  await f.store.registerChannel({ channelId: CHANNEL_ID, projectId: 'alpha' });
+  await f.store.bindChannelSession(CHANNEL_ID, 'session-fixed');
+  f.event('CHANNEL_UPDATE', { id: CHANNEL_ID, type: 0, parent_id: '555555555555555556' });
+  f.send(f.message('wrong directory?', { id: '111111111111111190' }));
+  await eventually(() => f.deliveries.some((entry) => /分组/u.test(entry.content ?? '')));
+  assert.equal(f.asks.length, 0);
+  assert.equal(f.store.channel(CHANNEL_ID).sessionId, 'session-fixed');
+  f.event('CHANNEL_UPDATE', { id: CHANNEL_ID, type: 0, parent_id: CATEGORY_ID });
+  f.send(f.message('back home', { id: '111111111111111191' }));
+  await eventually(() => f.asks.length === 1);
+  assert.equal(f.asks[0].sessionId, 'session-fixed');
+});
+
+test('deleting a channel retains the original session restore index', async (t) => {
+  const f = await fixture(t);
+  t.after(() => f.close());
+  await f.store.registerChannel({ channelId: CHANNEL_ID, projectId: 'alpha' });
+  await f.store.bindChannelSession(CHANNEL_ID, 'session-fixed');
+  f.event('CHANNEL_DELETE', { id: CHANNEL_ID, type: 0 });
+  await eventually(() => f.store.channel(CHANNEL_ID) === null);
+  assert.equal(f.store.session('session-fixed').detached, true);
   assert.equal(f.asks.length, 0);
 });
 
@@ -388,4 +436,87 @@ test('a disabled workbench leaves the legacy runtime untouched', async (t) => {
   // Rebuilding the runtime without a workbench must not change thread behavior.
   assert.equal(f.runtime.workbench.guildId, GUILD_ID);
   assert.equal(f.runtime.status.ready, true);
+});
+
+for (const code of [4007, 4009]) {
+  test(`Gateway close ${code} discards the invalid resume session`, async (t) => {
+    const f = await fixture(t);
+    t.after(() => f.close());
+    const original = f.socket;
+    original.close(code);
+    await eventually(() => f.socket !== original && f.socket.sent.length > 0, 2000);
+    assert.equal(f.socket.sent[0].op, 2);
+    // The replacement socket must identify; resuming the expired session loops forever.
+    assert.equal(f.runtime.status.ready, true);
+  });
+}
+
+test('restart retires a known-unsubmitted queued task after asking the operator to resend', async (t) => {
+  const f = await fixture(t);
+  t.after(() => f.close());
+  await f.store.registerChannel({ channelId: CHANNEL_ID, projectId: 'alpha' });
+  await f.store.bindChannelSession(CHANNEL_ID, 'existing-session');
+  const messageId = '111111111111111188';
+  await f.store.beginOperation({ operationId: `message-${messageId}`, kind: 'message-task', state: 'queued',
+    payload: { messageId, channelId: CHANNEL_ID, operatorId: OPERATOR_ID, sessionId: 'existing-session' } });
+  f.event('RESUMED', {});
+  await eventually(() => f.deliveries.some((item) => item.content.includes('重新发送')));
+  await eventually(() => f.store.operation(`message-${messageId}`).state === 'cancelled');
+});
+
+test('a project path replaced by an escaping symlink cannot submit channel input', async (t) => {
+  const f = await fixture(t);
+  t.after(() => f.close());
+  await f.store.registerChannel({ channelId: CHANNEL_ID, projectId: 'alpha' });
+  await f.store.bindChannelSession(CHANNEL_ID, 'fixed-session');
+  await rename(f.workspace, `${f.workspace}-original`);
+  await symlink(tmpdir(), f.workspace);
+  f.send(f.message('must not run', { id: '111111111111111189' }));
+  await eventually(() => f.asks.length > 0 || f.deliveries.some((item) => /目录/.test(item.content)));
+  assert.equal(f.asks.length, 0);
+  assert.equal(f.created.length, 0);
+});
+
+test('an ambiguous queued-recovery notice cannot leave an unsubmitted task blocking archive', async (t) => {
+  const f = await fixture(t);
+  t.after(() => f.close());
+  await f.store.registerChannel({ channelId: CHANNEL_ID, projectId: 'alpha' });
+  await f.store.bindChannelSession(CHANNEL_ID, 'existing-session');
+  const messageId = '111111111111111190';
+  await f.store.beginOperation({ operationId: `message-${messageId}`, kind: 'message-task', state: 'queued',
+    payload: { messageId, channelId: CHANNEL_ID, operatorId: OPERATOR_ID, sessionId: 'existing-session', noticeState: 'sending-queued' } });
+  f.event('RESUMED', {});
+  await eventually(() => f.store.operation(`message-${messageId}`).state === 'cancelled');
+  assert.equal(f.asks.length, 0);
+});
+
+
+test('stop waits for an accepted message journal write before releasing runtime resources', async (t) => {
+  const f = await fixture(t);
+  await f.store.registerChannel({ channelId: CHANNEL_ID, projectId: 'alpha', title: 'alpha' });
+  await f.store.bindChannelSession(CHANNEL_ID, 'session-fixed');
+  const original = f.store.beginOperation.bind(f.store);
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let writing = false;
+  f.store.beginOperation = async (operation) => {
+    if (operation.kind === 'message-task') {
+      writing = true;
+      await gate;
+    }
+    return original(operation);
+  };
+  f.send(f.message('pending admission', { id: '111111111111111199' }));
+  await eventually(() => writing);
+  let stopped = false;
+  const stopping = f.runtime.stop().then(() => { stopped = true; });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(stopped, false, 'shutdown must wait for the full message handler');
+  } finally {
+    release();
+    await stopping;
+  }
+  assert.equal(f.store.operation('message-111111111111111199').state, 'failed');
+  assert.equal(f.asks.length, 0, 'shutdown must not submit a pending admission');
 });

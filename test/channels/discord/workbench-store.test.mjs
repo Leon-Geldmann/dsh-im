@@ -78,10 +78,53 @@ test('a channel keeps exactly one session binding for its whole life', async (t)
   );
   await store.registerChannel({ channelId: OTHER_CHANNEL, projectId: 'alpha' });
   await assert.rejects(store.bindChannelSession(OTHER_CHANNEL, SESSION), { code: 'workbench-session-taken' });
-  // Replacing is an explicit, verified operation.
-  await store.bindChannelSession(CHANNEL, OTHER_SESSION, { replace: true });
-  assert.equal(store.channel(CHANNEL).sessionId, OTHER_SESSION);
-  assert.equal(store.session(SESSION), null);
+  await assert.rejects(
+    store.bindChannelSession(CHANNEL, OTHER_SESSION, { replace: true }),
+    { code: 'workbench-session-conflict' },
+  );
+  assert.equal(store.channel(CHANNEL).sessionId, SESSION);
+  assert.equal(store.session(SESSION).channelId, CHANNEL);
+});
+
+test('instance and bot identity survive restart and reject copied bindings', async (t) => {
+  const { store, path } = await fixture(t);
+  const identity = { guildId: GUILD, botId: '444444444444444444', instanceId: 'instance-alpha' };
+  await store.bindIdentity(identity);
+  const reloaded = await new DiscordWorkbenchStore(path).load();
+  await reloaded.bindIdentity(identity);
+  await assert.rejects(reloaded.bindIdentity({ ...identity, instanceId: 'instance-beta' }), {
+    code: 'workbench-identity-conflict',
+  });
+  await assert.rejects(reloaded.bindIdentity({ ...identity, botId: '444444444444444445' }), {
+    code: 'workbench-identity-conflict',
+  });
+  assert.deepEqual(reloaded.snapshot().identity, identity);
+});
+
+test('a live project directory cannot change underneath its fixed channels', async (t) => {
+  const { store } = await fixture(t);
+  await bindProject(store);
+  await store.registerChannel({ channelId: CHANNEL, projectId: 'alpha' });
+  await assert.rejects(store.putProject({
+    ...store.project('alpha'), workspacePath: '/home/user/projects/beta',
+  }), { code: 'workbench-project-conflict' });
+  assert.equal(store.project('alpha').workspacePath, '/home/user/projects/alpha');
+});
+
+test('durable action claims refuse missing scope and survive immediate reload', async (t) => {
+  const { store, path } = await fixture(t);
+  await store.putAction({
+    actionId: 'durable', kind: 'stop', operatorId: '444444444444444444',
+    guildId: GUILD, channelId: CHANNEL, expiresAt: Date.now() + 60_000,
+  });
+  assert.equal((await store.claimAction('durable')).ok, false);
+  const context = { operatorId: '444444444444444444', guildId: GUILD, channelId: CHANNEL };
+  const results = await Promise.all([
+    store.claimAction('durable', context), store.claimAction('durable', context),
+  ]);
+  assert.equal(results.filter((r) => r.ok).length, 1);
+  const reloaded = await new DiscordWorkbenchStore(path).load();
+  assert.equal((await reloaded.claimAction('durable', context)).reason, 'consumed');
 });
 
 test('channel lifecycle and errors are recorded without losing the session', async (t) => {
@@ -124,7 +167,9 @@ test('interaction actions are consumed exactly once with the real reason', async
     store.takeAction('a1', { operatorId: '555555555555555555', guildId: GUILD }).reason,
     'operator',
   );
-  assert.equal(store.takeAction('a1', { guildId: OTHER_CHANNEL }).reason, 'scope');
+  assert.equal(store.takeAction('a1', {
+    operatorId: '444444444444444444', guildId: OTHER_CHANNEL,
+  }).reason, 'scope');
   const first = store.takeAction('a1', { operatorId: '444444444444444444', guildId: GUILD, channelId: CHANNEL });
   assert.equal(first.ok, true);
   const second = store.takeAction('a1', { operatorId: '444444444444444444', guildId: GUILD, channelId: CHANNEL });

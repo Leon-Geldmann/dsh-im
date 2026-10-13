@@ -120,13 +120,14 @@ function fixture({ interaction, askAnswer = async () => 'done' } = {}) {
       };
     },
   };
+  const state = stateFixture();
   const bridge = new DiscordHarnessBridge({
     bot,
     harness,
-    state: stateFixture(),
+    state,
     logger: { warn() {}, error() {}, debug() {} },
   });
-  return { bridge, cards, sent, edits, notices, finish: gate.resolve };
+  return { bridge, state, cards, sent, edits, notices, finish: gate.resolve };
 }
 
 test('a question with options is delivered as buttons and submits the pressed label', async () => {
@@ -169,7 +170,8 @@ test('a question with options is delivered as buttons and submits the pressed la
   await processing;
 });
 
-test('a multi-select question keeps the text flow instead of unusable buttons', async () => {
+test('a native multi-select submits the selected set once and refuses invalid values', async () => {
+  const answered = [];
   const f = fixture({
     interaction: (sessionId, finish) => ({
       kind: 'question',
@@ -186,17 +188,21 @@ test('a multi-select question keeps the text flow instead of unusable buttons', 
           options: [{ label: 'A' }, { label: 'B' }],
         }],
       },
-      respond: async () => { finish(); return { accepted: true }; },
+      respond: async (result) => { answered.push(result); finish(); return { accepted: true }; },
     }),
   });
   const processing = f.bridge.accept(message('m-2', '多选问题'));
-  await eventually(() => f.sent.some((entry) => /可以多选/u.test(entry.text)));
-  assert.equal(f.cards.length, 0);
-  // A press can only name a card that was never delivered, so it is refused as
-  // stale; the question itself stays answerable as text.
-  await f.bridge.acceptCallback(callback({ data: 'wbq:nonce:0:0' }));
+  await eventually(() => f.cards.length === 1);
+  const select = f.cards[0].markup.components[0].components[0];
+  assert.equal(select.type, 3);
+  assert.equal(select.max_values, 2);
+  await f.bridge.acceptCallback(callback({ data: select.custom_id, values: ['99'] }));
   assert.match(f.notices.at(-1).text, /失效/u);
-  f.finish();
+  assert.equal(answered.length, 0);
+  await f.bridge.acceptCallback(callback({ data: select.custom_id, values: ['0', '1'] }));
+  assert.deepEqual(answered[0].value.answer.answers, [{ id: 'pick', selected: ['A', 'B'] }]);
+  await f.bridge.acceptCallback(callback({ data: select.custom_id, values: ['0'] }));
+  assert.equal(answered.length, 1);
   await processing;
 });
 
@@ -267,4 +273,97 @@ test('approval presses from another actor are refused', async () => {
   assert.match(f.notices.at(-1).text, /已处理或已失效/u);
   f.finish();
   await processing;
+});
+
+for (const [label, overrides] of [
+  ['another channel', { conversationId: '222222222222222299' }],
+  ['another conversation kind', { kind: 'direct' }],
+  ['a bot actor', { senderIsBot: true }],
+]) {
+  test(`an approval token cannot be used from ${label}`, async (t) => {
+    const answered = [];
+    const f = fixture({ interaction: (sessionId, finish) => ({
+      kind: 'approval', interactionId: 'scoped-approval', rpcId: 'scoped-approval', sessionId,
+      payload: { type: 'approval/requested', sessionId, approvalId: 'scoped-approval', toolName: 'bash', callId: 'call-scoped' },
+      toolCall: { name: 'bash', callId: 'call-scoped', arguments: '{}' },
+      respond: async (result) => { answered.push(result); finish(); return { accepted: true }; },
+    }) });
+    const processing = f.bridge.accept(message('scope-message', 'approval'));
+    t.after(async () => { f.finish(); await processing; });
+    await eventually(() => f.cards.some((card) => card.kind === 'approval'));
+    const data = f.cards.find((card) => card.kind === 'approval').markup.rows[0][0].id;
+    await f.bridge.acceptApprovalCallback(callback({ data, ...overrides }));
+    assert.equal(answered.length, 0);
+    await f.bridge.acceptApprovalCallback(callback({ data }));
+    assert.equal(answered.length, 1, 'a refused press must leave the original request usable');
+  });
+}
+
+for (const journalOwned of [false, true]) {
+  test(`prompt timeout ${journalOwned ? 'keeps recovery in the workbench journal' : 'retains legacy deferred recovery'}`, async (t) => {
+    const { mkdtemp, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { DiscordStateStore } = await import('../../../src/channels/discord/state-store.mjs');
+    const root = await mkdtemp(join(tmpdir(), 'workbench-recovery-owner-'));
+    const state = await new DiscordStateStore(join(root, 'state.json')).load();
+    const controller = new AbortController();
+    await state.setSession('group:222222222222222201', 'session-one');
+    const harness = {
+      workspaceSession: () => ({ sessionExists: async () => true, ask: async () => {
+        throw Object.assign(new Error('timeout'), { code: 'harness-reply-timeout', details: {
+          sessionId: 'session-one', promptRpcId: 'prompt-one', baselineSeq: -1, turn: 0,
+        } });
+      } }),
+      rpc: async () => ({ events: [], hasMore: false }),
+    };
+    const bridge = new DiscordHarnessBridge({ harness, state, signal: controller.signal,
+      bot: { sendText: async () => ({ providerMessageIds: [] }) },
+      logger: { warn() {}, error() {}, debug() {} },
+    });
+    t.after(async () => { controller.abort(); await bridge.waitForIdle(); await rm(root, { recursive: true, force: true }); });
+    await bridge.accept(message('timeout-message', 'long job', journalOwned ? { onPromptState: async () => {} } : {}));
+    await bridge.waitForIdle();
+    assert.equal(state.deferredEntries().length, journalOwned ? 0 : 1);
+  });
+}
+
+test('an approval cannot follow a changed Session binding', async (t) => {
+  const answered = [];
+  const f = fixture({ interaction: (sessionId, finish) => ({
+    kind: 'approval', interactionId: 'bound-approval', rpcId: 'bound-approval', sessionId,
+    payload: { type: 'approval/requested', sessionId, approvalId: 'bound-approval', toolName: 'bash', callId: 'bound-call' },
+    toolCall: { name: 'bash', callId: 'bound-call', arguments: '{}' },
+    respond: async (result) => { answered.push(result); finish(); return { accepted: true }; },
+  }) });
+  const processing = f.bridge.accept(message('bound-message', 'approval'));
+  t.after(async () => { f.finish(); await processing; });
+  await eventually(() => f.cards.some((card) => card.kind === 'approval'));
+  const data = f.cards.find((card) => card.kind === 'approval').markup.rows[0][0].id;
+  await f.state.setSession('group:222222222222222201', 'different-session');
+  await f.bridge.acceptApprovalCallback(callback({ data }));
+  assert.equal(answered.length, 0);
+});
+
+test('a Web-originated approval renders native buttons and retires after Web wins', async () => {
+  const f = fixture();
+  const completion = deferred();
+  const answered = [];
+  const key = 'group:222222222222222201';
+  await f.state.setSession(key, 'session-one');
+  await f.bridge.presentSessionSyncApproval({
+    kind: 'approval', interactionId: 'web-approval', rpcId: 'web-approval', sessionId: 'session-one',
+    payload: { type: 'approval/requested', sessionId: 'session-one', approvalId: 'web-approval', toolName: 'bash', callId: 'web-call' },
+    toolCall: { name: 'bash', callId: 'web-call', arguments: '{}' },
+    respond: async (result) => { answered.push(result); return { accepted: true }; },
+  }, { key, actor: 'actor-a', target: { channelId: '222222222222222201' }, send: async () => {}, validate: async () => {} },
+  { completion: completion.promise });
+  assert.equal(f.cards.length, 1);
+  const data = f.cards[0].markup.rows[0][0].id;
+  completion.resolve('approved');
+  await f.bridge.waitForIdle();
+  await new Promise((resolve) => setImmediate(resolve));
+  await f.bridge.acceptApprovalCallback(callback({ data }));
+  assert.equal(answered.length, 0);
+  assert.match(f.notices.at(-1).text, /已处理|已失效/);
 });

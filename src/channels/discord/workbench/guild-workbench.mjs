@@ -19,8 +19,8 @@ const LEGACY_COMMAND_REFUSALS = [
     message: '工作台模式下每个频道固定一个会话。请在项目分组中执行 /session new 新建会话频道。',
   },
   {
-    test: (text) => /^\/(?:session|sessions)(?:\s|$)/iu.test(text) && !/^\/session\s+(?:new|open|info|history|archive|restore)\b/iu.test(text),
-    message: '请使用原生命令 /session open <会话ID> 绑定会话，避免在频道内切换绑定。',
+    test: (text) => /^\/(?:session|sessions)(?:\s|$)/iu.test(text),
+    message: '工作台模式下每个频道固定一个会话。请使用 Discord 原生命令管理会话频道。',
   },
   {
     test: (text) => /^\/(?:workspace|ws|conv|conversation|thread|preset|presetlist|presets)(?:\s|$)/iu.test(text),
@@ -37,7 +37,7 @@ export class DiscordGuildWorkbench {
   #queue;
 
   constructor({
-    config, store, harness, ownerUserId = null, logger = console, createOptions = {},
+    config, store, harness, state = null, ownerUserId = null, logger = console, createOptions = {},
     queue = null,
   }) {
     const normalized = normalizeWorkbenchConfig(config);
@@ -50,9 +50,15 @@ export class DiscordGuildWorkbench {
     this.#queue = queue ?? new WorkbenchQueue({
       maxConcurrentTasks: normalized.maxConcurrentTasks,
       projectConcurrency: normalized.projectConcurrency,
+      reservations: () => store.listOperations().filter((entry) => entry.kind === 'message-task'
+        && ['submitting', 'submitted', 'running', 'submission-unknown'].includes(entry.state))
+        .map((entry) => ({
+          sessionId: entry.payload.sessionId ?? store.channel(entry.payload.channelId)?.sessionId ?? entry.operationId,
+          projectId: store.channel(entry.payload.channelId)?.projectId,
+        })),
     });
     this.#router = new ChannelSessionRouter({
-      store, harness, logger, createOptions, queue: this.#queue,
+      store, harness, state, logger, createOptions, queue: this.#queue,
     });
   }
 
@@ -95,6 +101,11 @@ export class DiscordGuildWorkbench {
     const existing = this.#store.channel(channelId);
     if (existing) return existing;
     return this.#store.registerChannel({ channelId, projectId, title });
+  }
+
+  /** Prepare project scoping and the fixed binding before tasks or controls. */
+  prepareChannel(channelId) {
+    return this.#router.prepareChannel(channelId);
   }
 
   /** Whether one sender may drive workbench operations from a Guild context. */

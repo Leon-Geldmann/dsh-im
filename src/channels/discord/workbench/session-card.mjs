@@ -86,7 +86,27 @@ export function buildSessionCard({
 
   const components = [];
   if (buttons.length > 0) components.push({ type: 1, components: buttons });
-  if (actions.model && Array.isArray(actions.modelOptions) && actions.modelOptions.length > 0) {
+  const seenModels = new Set();
+  let selectedModel = false;
+  const modelOptions = (Array.isArray(actions.modelOptions) ? actions.modelOptions : [])
+    .filter((option) => {
+      if (typeof option?.value !== 'string' || !option.value || option.value.length > 100
+        || typeof option.label !== 'string' || !option.label || seenModels.has(option.value)) return false;
+      seenModels.add(option.value);
+      return true;
+    })
+    .slice(0, 25)
+    .map((option) => {
+      const selected = option.selected === true && !selectedModel;
+      selectedModel ||= selected;
+      return {
+        label: truncate(option.label, 100),
+        value: option.value,
+        ...(option.description ? { description: truncate(option.description, 100) } : {}),
+        ...(selected ? { default: true } : {}),
+      };
+    });
+  if (actions.model && modelOptions.length > 0) {
     components.push({
       type: 1,
       components: [{
@@ -95,12 +115,7 @@ export function buildSessionCard({
         placeholder: '切换当前会话模型',
         min_values: 1,
         max_values: 1,
-        options: actions.modelOptions.slice(0, 25).map((option) => ({
-          label: truncate(option.label, 100),
-          value: truncate(option.value, 100),
-          ...(option.description ? { description: truncate(option.description, 100) } : {}),
-          ...(option.selected ? { default: true } : {}),
-        })),
+        options: modelOptions,
       }],
     });
   }

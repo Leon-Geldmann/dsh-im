@@ -344,6 +344,11 @@ export class TextHarnessBridge {
     const key = `${normalized.kind}:${normalized.conversationId}`;
     const pending = this.#pendingInteractions.get(key);
     const text = controlTextOf(normalized);
+    if (this.#commandOverride) {
+      const refusal = this.#commandOverride(text, { key, message: normalized,
+        hasImages: hasInboundImages(normalized), hasFiles: hasInboundFiles(normalized) });
+      if (refusal) return this.#finishLocalMessage(normalized, messageId, refusal);
+    }
     if (isClearCommand(text) && (
       this.#queues.has(key)
       || pending
@@ -895,7 +900,8 @@ export class TextHarnessBridge {
         keepaliveTimer.unref?.();
       }
       const { answer, artifacts = [] } = await askInWorkspaceSession({
-        deferredDelivery: () => ({ coordinator: this.#deferred, target: this.#descriptor.key === 'whatsapp' ? { jid: target.jid, selfChat: target.selfChat } : target }),
+        deferredDelivery: typeof message.onPromptState === 'function' ? undefined
+          : () => ({ coordinator: this.#deferred, target: this.#descriptor.key === 'whatsapp' ? { jid: target.jid, selfChat: target.selfChat } : target }),
         harness: this.#harness,
         state: this.#state,
         key: conversationKey,
@@ -910,6 +916,7 @@ export class TextHarnessBridge {
         createOptions: this.#signal ? { signal: this.#signal } : undefined,
         existsOptions: this.#signal ? { signal: this.#signal } : undefined,
         askOptions: {
+          ...(typeof message.onPromptState === 'function' ? { onPromptState: message.onPromptState } : {}),
           timeoutMs: this.#replyTimeoutMs,
           signal: this.#signal,
           control: { owner: this, key: conversationKey },
@@ -966,6 +973,7 @@ export class TextHarnessBridge {
         ? t(FILE_ONLY_COMPLETION_TEXT)
         : answer;
       const answerFormat = fileOnlyCompletion ? 'plain' : 'markdown';
+      await message.onTaskState?.('delivering', { text: visibleAnswer });
       let textDeliveryError = null;
       let textReceipt = null;
       if (stream) {
@@ -1044,9 +1052,13 @@ export class TextHarnessBridge {
       }
       // The turn produced an answer, so its retry budget is spent and reset.
       this.#deliveryAttempts.delete(messageId);
+      await message.onTaskState?.('delivered', {
+        deliveryMessageIds: delivery.receipt?.providerMessageIds ?? [],
+      });
       return delivery.receipt;
     } catch (error) {
       stopKeepalive();
+      await message.onTaskState?.('error', { errorCode: error?.code ?? null });
       const turnStopped = error?.code === 'turn-stopped';
       if (batchSubmission && turnStopped) {
         this.#batches.complete(conversationKey, batchSubmission.token);
@@ -1411,18 +1423,20 @@ export class TextHarnessBridge {
 
     const question = pending.questions[pending.index];
     const parsed = this.#interactionCard?.parse?.(callback.data) ?? null;
+    if (!question) return notice(t('该问题已处理，无需再次选择。'));
+    const nativeAnswer = this.#interactionCard?.answer?.(question, parsed, callback) ?? null;
     const option = parsed && Array.isArray(question?.options)
       ? question.options[parsed.optionIndex]
       : undefined;
     if (!question || !parsed
       || !pending.cardNonce || parsed.nonce !== pending.cardNonce
       || parsed.questionIndex !== pending.index
-      || !option || typeof option.label !== 'string') {
+      || (!nativeAnswer && (!option || typeof option.label !== 'string'))) {
       return notice(t('这个选项已失效，请使用最新一条问题。'));
     }
     // Multi-select needs a keyboard that accumulates choices and a submit action;
     // until that exists the request keeps the text answer it has always accepted.
-    if (question.multiSelect === true) {
+    if (question.multiSelect === true && !nativeAnswer) {
       return notice(t('多选问题请直接回复文字。'));
     }
 
@@ -1431,7 +1445,7 @@ export class TextHarnessBridge {
     // as soon as its API accepted the keyboard. Wait for delivery so the card id
     // exists and the shared submission path can retire its keyboard.
     await pending.presentationTask?.catch(() => undefined);
-    await notice(t('已选择：{label}', { label: option.label }));
+    await notice(t('已选择：{label}', { label: nativeAnswer?.selected.join(', ') ?? option.label }));
     await this.#processInteractionReply(
       {
         kind,
@@ -1439,7 +1453,7 @@ export class TextHarnessBridge {
         messageId,
         senderId,
         addressed: true,
-        content: option.label,
+        content: nativeAnswer?.selected.join(', ') ?? option.label,
         replyTarget: callback.replyTarget ?? pending.target,
         statusReaction: null,
       },
@@ -1450,7 +1464,7 @@ export class TextHarnessBridge {
       // The press already identifies its option by index, so answer with that
       // exact label. Replaying the label as reply text would re-parse a numeric
       // label such as "2" as the second option and submit a different one.
-      { resolveAnswer: (current) => ({ id: current.id, selected: [option.label] }) },
+      { resolveAnswer: (current) => nativeAnswer ?? ({ id: current.id, selected: [option.label] }) },
     ).catch((error) => {
       this.#logger.error?.(
         `[dsh-im:${this.#descriptor.key}] failed to submit a card answer:`,
@@ -1463,7 +1477,10 @@ export class TextHarnessBridge {
   }
 
   async presentSessionSyncApproval(interaction, context, options = {}) {
-    return this.#approvals.handleSessionSyncRequested(interaction, context, {
+    return this.#approvals.handleSessionSyncRequested(interaction, {
+      ...context,
+      ...(context.target ? { render: this.#approvalRenderer({ target: context.target }) ?? context.render } : {}),
+    }, {
       ...options, runtimeSignal: this.#signal ?? options.runtimeSignal, accessPolicy: this.#accessPolicy,
     });
   }
@@ -1492,7 +1509,10 @@ export class TextHarnessBridge {
         await sendFallback(pending.text);
         return;
       }
-      this.#approvalTokens.set(token, { approvalId: pending.approvalId, nonce });
+      this.#approvalTokens.set(token, {
+        approvalId: pending.approvalId, nonce, key: pending.key,
+        sessionId: pending.sessionId, actor: pending.actor,
+      });
       const sent = await this.#bot.sendApprovalCard(target, {
         text: card.text,
         markup: card.markup,
@@ -1514,6 +1534,13 @@ export class TextHarnessBridge {
     if (!parsed) return notice(t('这个审批卡片已失效。'));
     const entry = this.#approvalTokens.get(parsed.token);
     if (!entry || entry.nonce !== parsed.nonce) return notice(t('这个审批卡片已失效。'));
+    const conversationId = cleanText(callback?.conversationId);
+    const key = `${callback?.kind}:${conversationId}`;
+    if (!conversationId || callback?.senderIsBot === true || key !== entry.key
+      || cleanText(callback?.senderId) !== entry.actor
+      || this.#state.sessionFor(key) !== entry.sessionId) {
+      return notice(t('这个审批已处理或已失效。'));
+    }
     if (parsed.outcome !== 'approved' && parsed.outcome !== 'rejected') {
       return notice(t('无法识别的审批选项。'));
     }

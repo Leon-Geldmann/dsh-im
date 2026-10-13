@@ -1699,6 +1699,33 @@ export class HarnessClient {
 
   async ask(sessionId, prompt, options = {}) {
     if (typeof options === 'number') options = { timeoutMs: options };
+    const facts = {
+      sessionId, promptRpcId: null, baselineSeq: null, turn: null, lastSeq: null,
+      submissionState: 'not-submitted', uncertain: false, turnFinished: false,
+    };
+    const lifecycle = {
+      facts,
+      emit: async (state, patch = {}) => {
+        Object.assign(facts, patch);
+        await options.onPromptState?.({ ...facts, state });
+      },
+    };
+    try {
+      return await this.#ask(sessionId, prompt, options, lifecycle);
+    } catch (error) {
+      try {
+        await lifecycle.emit('failed', {
+          uncertain: facts.submissionState === 'unknown',
+          errorCode: typeof error?.code === 'string' ? error.code : null,
+        });
+      } catch {
+        // A failed failure checkpoint must not hide the original submission error.
+      }
+      throw error;
+    }
+  }
+
+  async #ask(sessionId, prompt, options, lifecycle) {
     const timeoutMs = options.timeoutMs ?? 600_000;
     const signal = options.signal;
     const onUpdate = typeof options.onUpdate === 'function' ? options.onUpdate : null;
@@ -1728,6 +1755,7 @@ export class HarnessClient {
     );
     const baselineSeq = Math.max(-1, ...(before.events ?? []).map(({ event }) => event.seq ?? -1));
     const promptRpcId = `${this.#rpcIdPrefix}-${randomUUID()}`;
+    Object.assign(lifecycle.facts, { promptRpcId, baselineSeq, lastSeq: baselineSeq });
     const releasePromptInputOrigin = registerImInputOrigin(this.#interactionRegistry, promptRpcId);
     const tracker = new HarnessReplyTracker({
       promptRpcId, afterSeq: baselineSeq, reasoning, finalAnswerOnly: options.finalAnswerOnly,
@@ -1741,6 +1769,7 @@ export class HarnessClient {
         live: progressMode === 'live',
         fromMux,
       });
+      Object.assign(lifecycle.facts, { turn: tracker.turn, lastSeq: tracker.lastSeq });
       const seqAdvanced = tracker.lastSeq > lastPollSeq;
       lastPollSeq = tracker.lastSeq;
       if (seqAdvanced) lastProgressAt = Date.now();
@@ -1891,15 +1920,30 @@ export class HarnessClient {
       // message that merely looks like a guidance block is not configuration.
       imSourceGuidance.publish(sessionId, options.sourceGuidance);
       const clientTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      const sendPrompt = (promptContent) => this.#sessionRpc('session.prompt', {
-        sessionId,
-        mode: 'queue',
-        content: promptContent,
-        clientTimeZone,
-      }, 30_000, { rpcId: promptRpcId, signal });
+      const sendPrompt = async (promptContent) => {
+        await lifecycle.emit('submitting', { submissionState: 'not-submitted', uncertain: false });
+        signal?.throwIfAborted();
+        lifecycle.facts.submissionState = 'unknown';
+        try {
+          await this.#sessionRpc('session.prompt', {
+            sessionId,
+            mode: 'queue',
+            content: promptContent,
+            clientTimeZone,
+          }, 30_000, { rpcId: promptRpcId, signal });
+        } catch (error) {
+          if (error instanceof HarnessRpcError && !['internal', 'gateway/internal'].includes(error.code)) {
+            lifecycle.facts.submissionState = 'rejected';
+          }
+          throw error;
+        }
+        promptAccepted = true;
+        await lifecycle.emit('submitted', { submissionState: 'submitted' });
+      };
       try {
         await sendPrompt(content);
       } catch (error) {
+        if (lifecycle.facts.submissionState !== 'rejected') throw error;
         // The Host refuses image blocks for a non-vision model before any
         // durable user message exists. Re-deliver the same bytes the way
         // ordinary uploads (zip, documents) already travel — staged into the
@@ -1959,6 +2003,7 @@ export class HarnessClient {
           await consumeProgress(history.events ?? []);
           if (tracker.finished) {
             turnFinished = true;
+            lifecycle.facts.turnFinished = true;
             if (!ownership?.stopRequested && !harnessTurnSucceeded(tracker.reason)) {
               const failure = harnessTurnError(tracker.reason);
               if (failure.code === 'turn-blocked') {
@@ -1966,6 +2011,10 @@ export class HarnessClient {
               }
               throw failure;
             }
+            await lifecycle.emit('completed', {
+              completionObserved: true,
+              text: ownership?.stopRequested ? tracker.answer : tracker.finalAnswer,
+            });
             // An accepted /stop revokes attachment delivery even when Harness
             // preserved a useful partial text answer for the existing UX.
             const artifactCount = ownership?.stopRequested

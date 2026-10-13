@@ -140,7 +140,7 @@ Session 且原绑定不变；4. 绑定 Session 失效不自动替换；5. 并发
 4. 生命周期：归档、队列、半成功恢复、同步（含测试）。
 5. 文档、构建、打包、验收清单。
 
-## 实施状态
+## 原会话实施状态（2026-10-11，已被接续验收替代）
 
 - 第 1-5 阶段已完成：状态层、路由层、交互层（命令/组件/Modal/信息卡/限流）、
   生命周期（归档、深度归档、恢复、半成功恢复）、任务队列、Discord 频道的
@@ -151,3 +151,11 @@ Session 且原绑定不变；4. 绑定 Session 失效不自动替换；5. 并发
 - 构建：`npm run build` 与 `node scripts/verify-package.mjs` 通过。
 - 尚未真实联调：需要 Bot Token 与测试 Guild，详见 `docs/discord-workbench.md`
   的验收清单与"已知限制"。
+
+
+## 2026-10-13 接续验收
+
+原记录中“0 失败”曾包含 cancelled，不能视为全量通过。新的计划和原始需求镜像位于
+`docs/superpowers/plans/2026-10-13-discord-workbench-takeover.md`。本轮补齐持久任务、
+审批作用域、归档快照、半完成恢复、网关失效 session、容量和项目路径复核，并修正测试进程保活。
+实际检查结果以接续计划的执行记录及 `docs/discord-workbench.md` 的能力边界为准。

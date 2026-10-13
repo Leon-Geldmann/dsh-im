@@ -2,8 +2,10 @@ import { randomUUID } from 'node:crypto';
 
 import { textFromHarnessContent } from '../../shared/harness-client.mjs';
 import { runCompactCommand } from '../../shared/compact-command.mjs';
+import { withSessionBindingLock } from '../../shared/session-binding-lock.mjs';
 import { CHANNEL_LIFECYCLE } from './workbench-store.mjs';
 import { buildSessionCard, componentId } from './session-card.mjs';
+import { saveArchiveSnapshot } from './archive-snapshot.mjs';
 import {
   ensureProjectDirectory,
   isWorkspacePathError,
@@ -49,7 +51,7 @@ export const WORKBENCH_COMMANDS = Object.freeze([
     description: '管理项目与频道分组',
     options: [
       subcommand('bind', '把一个分组绑定为项目目录', [
-        option('category', '选择分组', 'CHANNEL', { required: true, channelTypes: [4] }),
+        option('category', '选择分组', 'CHANNEL', { required: true, channel_types: [4] }),
         option('path', '已存在的绝对目录', 'STRING', { required: true }),
         option('name', '项目显示名称', 'STRING'),
       ]),
@@ -74,7 +76,7 @@ export const WORKBENCH_COMMANDS = Object.freeze([
       ]),
       subcommand('info', '查看当前频道会话信息'),
       subcommand('history', '查看当前会话历史', [
-        option('count', '条数 1-20', 'INTEGER', { minValue: 1, maxValue: MAX_HISTORY_MESSAGES }),
+        option('count', '条数 1-20', 'INTEGER', { min_value: 1, max_value: MAX_HISTORY_MESSAGES }),
       ]),
       subcommand('archive', '归档当前会话', [
         option('deep', '深度归档（删除频道，保留会话）', 'BOOLEAN'),
@@ -199,9 +201,10 @@ export class WorkbenchCommands {
   #logger;
   #now;
   #models = new Map();
+  #controlOwner;
 
   constructor({
-    workbench, api, harness, admin = null, queue = null, logger = console, now = () => Date.now(),
+    workbench, api, harness, admin = null, queue = null, controlOwner = null, logger = console, now = () => Date.now(),
   }) {
     if (!workbench || !api || !harness) {
       throw new TypeError('WorkbenchCommands requires workbench, api and harness');
@@ -213,6 +216,7 @@ export class WorkbenchCommands {
     this.#queue = queue;
     this.#logger = logger;
     this.#now = now;
+    this.#controlOwner = controlOwner ?? this;
   }
 
   get store() { return this.#workbench.store; }
@@ -266,6 +270,13 @@ export class WorkbenchCommands {
       operatorId: String(interaction?.member?.user?.id ?? ''),
       channelId: String(interaction.channel_id ?? action.channelId ?? ''),
     };
+    const channel = this.store.channel(context.channelId);
+    if (!channel || (action.channelId && action.channelId !== context.channelId)
+      || (!['refresh', 'new-session'].includes(action.kind)
+        && action.sessionId !== channel.sessionId)) {
+      await helpers.respond({ content: '这个操作已失效，请刷新会话信息卡后重试。', ephemeral: true });
+      return;
+    }
     switch (action.kind) {
       case 'refresh': return this.#refreshCard(context);
       case 'new-session': return this.#newSessionFromCard(context);
@@ -276,6 +287,7 @@ export class WorkbenchCommands {
       case 'deep-archive': return this.#deepArchiveFromCard(context);
       case 'restore': return this.#restoreFromCard(context);
       case 'model': return this.#selectModel(context);
+      case 'reasoning': return this.#selectReasoning(context);
       default:
         await helpers.respond({ content: '不支持的操作。', ephemeral: true });
     }
@@ -288,6 +300,31 @@ export class WorkbenchCommands {
     }
     const project = this.store.project(channel.projectId);
     return { channel, project };
+  }
+
+  async #hasChannelCapacity(context, parentId = null) {
+    let channels;
+    try { channels = await this.#api.listGuildChannels({ guildId: this.#workbench.guildId }); }
+    catch {
+      await context.helpers.editOriginal({ content: '无法确认服务器频道容量，未创建频道。请检查连接和权限后重试。' });
+      return false;
+    }
+    if (!Array.isArray(channels)) throw new Error('Invalid Guild channel list');
+    const children = parentId ? channels.filter((item) => item.parent_id === parentId).length : 0;
+    if (channels.length >= 500 || children >= 50) {
+      await context.helpers.editOriginal({ content: '服务器频道或分组内频道已达到上限。请先深度归档旧会话，或选择其他项目分组。' });
+      return false;
+    }
+    if (channels.length >= 490 || children >= 45) {
+      await context.helpers.followup({ ephemeral: true, content: `频道容量接近上限（服务器 ${channels.length}/500，当前分组 ${children}/50），建议整理旧会话。` });
+    }
+    return true;
+  }
+
+  async #actionStillCurrent(context) {
+    if (!context.action || this.store.channel(context.channelId)?.sessionId === context.action.sessionId) return true;
+    await context.helpers.editOriginal({ content: '这个操作已失效，请刷新会话信息卡后重试。' });
+    return false;
   }
 
   async #mintCardActions(channel, project, session, { running }) {
@@ -348,13 +385,14 @@ export class WorkbenchCommands {
     try {
       const catalog = await this.#harness.getSessionModels(sessionId);
       const options = [];
-      for (const provider of catalog?.providers ?? []) {
+      if (catalog.current) this.#models.set(sessionId, catalog.current);
+      for (const provider of catalog?.groups ?? []) {
         for (const model of provider?.models ?? []) {
           options.push({
-            label: `${provider.name ?? provider.provider} · ${model.name ?? model.model}`,
-            value: `${provider.provider}/${model.model}`,
+            label: `${provider.name} · ${model.name}`,
+            value: `${provider.id}/${model.id}`,
             description: model.description,
-            selected: model.selected === true,
+            selected: catalog.current?.provider === provider.id && catalog.current?.model === model.id,
           });
         }
       }
@@ -526,6 +564,7 @@ export class WorkbenchCommands {
       return;
     }
     let category;
+    if (!await this.#hasChannelCapacity(context)) return;
     try {
       category = await this.#api.createGuildChannel({
         guildId: this.#workbench.guildId,
@@ -601,7 +640,13 @@ export class WorkbenchCommands {
     }
     const name = String(context.options.name ?? '').trim()
       || `${project.name} · ${new Date(this.#now()).toISOString().slice(5, 16).replace('T', ' ')}`;
-    const operationId = randomUUID();
+    if (!await this.#hasChannelCapacity(context, project.categoryId)) return;
+    const operationId = `native-create:${context.interaction.id}`;
+    const previous = this.store.operation(operationId);
+    if (previous) {
+      await context.helpers.editOriginal({ content: '这次创建已记录，未重复执行。请检查工作台操作记录。' });
+      return;
+    }
     await this.store.beginOperation({
       operationId,
       kind: 'create-session-channel',
@@ -618,7 +663,8 @@ export class WorkbenchCommands {
         topic: `DSH 工作台会话 · ${project.name}`,
       });
     } catch (error) {
-      await this.store.completeOperation(operationId);
+      if (Number(error?.status) >= 400 && Number(error?.status) < 500) await this.store.completeOperation(operationId);
+      else await this.store.updateOperation(operationId, { state: 'channel-create-unknown' });
       await context.helpers.editOriginal({
         content: '创建频道失败。请检查机器人的“管理频道”权限与服务器频道数量上限。',
       });
@@ -629,27 +675,21 @@ export class WorkbenchCommands {
       state: 'channel-created',
       payload: { projectId: project.projectId, name, channelId: String(channel.id) },
     });
-    await this.store.registerChannel({
-      channelId: String(channel.id),
-      projectId: project.projectId,
-      title: name,
-    });
     let sessionId;
     try {
-      sessionId = await this.#harness.createSession({ workspace: project.workspacePath });
+      await this.store.registerChannel({
+        channelId: String(channel.id), projectId: project.projectId, title: name,
+      });
+      await this.#workbench.prepareChannel(String(channel.id));
+      ({ sessionId } = await this.#workbench.router.createForChannel(String(channel.id), { titleText: name }));
     } catch (error) {
-      // Half-success: the channel exists but holds no Session. It stays
-      // registered so the next message there retries Session creation instead
-      // of leaving an unmanaged channel behind.
-      await this.store.noteChannelError(String(channel.id), '会话创建失败，将在下次收到消息时重试。');
-      await this.store.completeOperation(operationId);
+      await this.store.noteChannelError(String(channel.id), '会话创建失败；结果不明时不会重复创建，请检查操作记录。');
       await context.helpers.editOriginal({
-        content: `频道 <#${channel.id}> 已创建，但会话创建失败。请在该频道发送消息重试，或用 /status 查看连接状态。`,
+        content: `频道 <#${channel.id}> 已创建，但会话创建失败。已保留恢复记录；结果不明时不会重复创建。请用 /status 查看连接状态。`,
       });
       this.#logger.warn?.('[dsh-im:discord] session creation failed after channel creation:', error);
       return;
     }
-    await this.store.bindChannelSession(String(channel.id), sessionId, { title: name });
     await this.store.completeOperation(operationId);
     await context.helpers.editOriginal({
       content: `已创建会话频道 <#${channel.id}>\n会话：\`${sessionId}\`\n目录：\`${project.workspacePath}\``,
@@ -664,12 +704,50 @@ export class WorkbenchCommands {
     const sessionId = String(context.options.session_id ?? '').trim();
     const { workspaceSession, sessionExists } = this.#sessionHelpers();
     try {
+      const existing = this.store.channelForSession(sessionId);
+      if (existing && existing.channelId !== context.channelId) {
+        const actual = await this.#api.getChannel({ channelId: existing.channelId });
+        if (String(actual.guild_id) !== this.#workbench.guildId) throw new Error('Channel Guild mismatch');
+        await context.helpers.editOriginal({ content: `该会话已有频道入口 <#${existing.channelId}>。` });
+        return;
+      }
+      if (!this.store.channel(context.channelId)) {
+        const actual = await this.#api.getChannel({ channelId: context.channelId });
+        const project = this.store.projectForCategory(String(actual?.parent_id ?? ''));
+        if (String(actual?.guild_id) !== this.#workbench.guildId || actual?.type !== 0 || !project) {
+          throw new Error('Channel is outside the managed project');
+        }
+        const messages = await this.#api.listChannelMessages({ channelId: context.channelId, limit: 1 });
+        if (!Array.isArray(messages) || messages.length > 0) throw new Error('Channel is not empty');
+        await this.#assertSessionWorkspace(sessionId, project);
+        await this.store.registerChannel({ channelId: context.channelId, projectId: project.projectId, title: actual.name });
+      }
+      const { channel, project } = this.#requireChannel(context);
+      const handle = workspaceSession(this.#harness, sessionId, `group:${context.channelId}`);
+      if (await sessionExists(handle) !== true) {
+        throw Object.assign(new Error('Session does not exist'), { code: 'workbench-session-missing' });
+      }
+      if (channel.sessionId && channel.sessionId !== sessionId) {
+        throw Object.assign(new Error('The channel has a fixed Session'), { code: 'workbench-session-conflict' });
+      }
+      if (channel.lifecycle !== CHANNEL_LIFECYCLE.ACTIVE) {
+        throw Object.assign(new Error('The channel is archived'), { code: 'workbench-channel-archived' });
+      }
+      await this.#assertSessionWorkspace(sessionId, project);
+      await this.#workbench.prepareChannel(context.channelId);
       await this.#workbench.router.bindExistingSession(context.channelId, sessionId, {
         workspaceSession, sessionExists,
       });
     } catch (error) {
       await context.helpers.editOriginal({
-        content: error?.code === 'workbench-session-missing'
+        content: isWorkspacePathError(error) ? formatWorkspaceError(error)
+          : error?.code === 'workbench-session-conflict'
+            ? '当前频道已固定绑定一个会话。请用 /session new 创建新频道。'
+          : error?.code === 'workbench-channel-archived'
+            ? '当前频道已归档，请先用 /session restore 恢复。'
+          : error?.code === 'workbench-session-workspace'
+            ? '该会话不属于当前项目工作区，无法绑定。'
+          : error?.code === 'workbench-session-missing'
           ? '该会话不存在。请确认会话 ID 与所在工作区。'
           : error?.code === 'workbench-session-taken'
             ? '该会话已绑定到其它频道。' : '绑定失败，请稍后重试。',
@@ -684,11 +762,25 @@ export class WorkbenchCommands {
     // workspace-session keeps its helpers private; the router accepts the same
     // shapes, so build them from the Harness client here.
     return {
-      workspaceSession: (sessionId, key) => this.#harness.workspaceSession(sessionId, key),
+      workspaceSession: (harness, sessionId, key) => harness.workspaceSession(sessionId, key),
       sessionExists: async (session, options) => (options === undefined
         ? session.sessionExists()
         : session.sessionExists(options)),
     };
+  }
+
+  async #assertSessionWorkspace(sessionId, project) {
+    if (!project) throw new Error('The Session project is not registered');
+    const workspace = await verifyExistingDirectory(project.workspacePath, this.#workbench.config.projectRoots);
+    const recorded = this.store.session(sessionId);
+    if (recorded && recorded.projectId !== project.projectId) {
+      throw Object.assign(new Error('The Session belongs to another project'), { code: 'workbench-session-workspace' });
+    }
+    const page = await this.#harness.listWorkspaceSessions(workspace);
+    if (page?.workspace !== workspace || !Array.isArray(page.sessions)
+      || !page.sessions.some((session) => session?.sessionId === sessionId)) {
+      throw Object.assign(new Error('The Session is outside the project workspace'), { code: 'workbench-session-workspace' });
+    }
   }
 
   async #sessionInfo(context) {
@@ -737,6 +829,10 @@ export class WorkbenchCommands {
       await context.helpers.editOriginal({ content: '当前频道尚未纳入工作台管理。' });
       return;
     }
+    if (!channel.sessionId && context.options.deep !== true) {
+      await context.helpers.editOriginal({ content: '当前频道还没有会话。' });
+      return;
+    }
     if (context.options.deep === true) {
       const actionId = randomUUID();
       await this.store.putAction({
@@ -749,7 +845,7 @@ export class WorkbenchCommands {
         expiresAt: this.#now() + ACTION_TTL_MS,
       });
       await context.helpers.editOriginal({
-        content: '深度归档会删除这个 Discord 频道，但保留 DSH 会话与历史。确认后点击按钮。',
+        content: '深度归档会先保存历史与频道附件，再删除这个 Discord 频道；原 DSH 会话保留。保存失败不会删除。确认后点击按钮。',
         components: [{
           type: 1,
           components: [{
@@ -771,7 +867,11 @@ export class WorkbenchCommands {
   async #sessionRestore(context) {
     await context.helpers.defer({ ephemeral: true });
     const sessionId = String(context.options.session_id ?? '').trim();
-    const session = this.store.session(sessionId);
+    return withSessionBindingLock(this.store, `restore:${sessionId}`, () => this.#restoreSession(context, sessionId));
+  }
+
+  async #restoreSession(context, sessionId) {
+    let session = this.store.session(sessionId);
     if (!session) {
       await context.helpers.editOriginal({ content: '未找到该会话的归档记录。' });
       return;
@@ -781,41 +881,110 @@ export class WorkbenchCommands {
       await context.helpers.editOriginal({ content: '会话所属项目已被移除，无法恢复频道。' });
       return;
     }
-    let channel = this.store.channel(session.channelId);
+    const pending = this.store.listOperations().find((operation) => (
+      operation.kind === 'restore-channel'
+      && operation.payload.sessionId === sessionId
+    ));
+    if (pending && pending.state !== 'channel-created') {
+      await context.helpers.editOriginal({ content: '上次恢复频道的创建结果不明。为避免重复创建，请先检查服务器频道及操作记录。' });
+      return;
+    }
+    let channel = session.detached ? null : this.store.channel(session.channelId);
     if (channel) {
-      await this.store.setChannelLifecycle(channel.channelId, CHANNEL_LIFECYCLE.ACTIVE);
-      await context.helpers.editOriginal({ content: `已恢复频道 <#${channel.channelId}>。` });
-      await this.postCard(channel.channelId).catch(() => undefined);
-      return;
+      try {
+        const actual = await this.#api.getChannel({ channelId: channel.channelId });
+        if (actual.type !== 0 || actual.parent_id !== project.categoryId
+          || actual.guild_id !== this.#workbench.guildId) throw new Error('Restore route changed');
+      } catch (error) {
+        if (error?.status === 404 || error?.code === 10003) {
+          await this.store.detachChannel(channel.channelId);
+          session = this.store.session(sessionId);
+          channel = null;
+        } else {
+          await context.helpers.editOriginal({ content: '无法确认原频道状态，原绑定已保留；请检查连接、权限和分组后重试。' });
+          return;
+        }
+      }
     }
-    const operationId = randomUUID();
-    await this.store.beginOperation({
-      operationId, kind: 'restore-channel', state: 'channel-creating', payload: { sessionId },
-    });
-    try {
-      const previousTitle = this.store.channel(session.channelId)?.title;
-      channel = await this.#api.createGuildChannel({
-        guildId: this.#workbench.guildId,
-        name: (session.title ?? previousTitle ?? `恢复会话 ${sessionId.slice(0, 8)}`).slice(0, 100),
-        type: 0,
-        parentId: project.categoryId,
-        topic: `DSH 工作台会话 · 恢复`,
+    if (channel) {
+      return withSessionBindingLock(this.store, `channel:${channel.channelId}`, async () => {
+        channel = this.store.channel(session.channelId);
+        if (!channel || channel.sessionId !== sessionId || channel.projectId !== session.projectId) {
+          await context.helpers.editOriginal({ content: '原频道绑定已改变，无法恢复。请检查会话归档记录。' });
+          return;
+        }
+        await this.#workbench.prepareChannel(channel.channelId);
+        await this.store.setChannelLifecycle(channel.channelId, CHANNEL_LIFECYCLE.ACTIVE);
+        await this.store.noteChannelError(channel.channelId, null);
+        if (pending?.payload.channelId === channel.channelId) await this.store.completeOperation(pending.operationId);
+        await context.helpers.editOriginal({ content: `已恢复频道 <#${channel.channelId}>。` });
+        await this.postCard(channel.channelId).catch(() => undefined);
       });
-    } catch (error) {
-      await this.store.completeOperation(operationId);
-      this.#logger.warn?.('[dsh-im:discord] restore channel creation failed:', error);
-      await context.helpers.editOriginal({ content: '创建恢复频道失败，请检查频道数量上限与权限。' });
+    }
+    if (!session.detached || session.state !== 'archived') {
+      await context.helpers.editOriginal({ content: '该会话没有可恢复的归档记录。' });
       return;
     }
-    await this.store.registerChannel({
-      channelId: String(channel.id),
-      projectId: project.projectId,
-      title: session.title ?? `恢复会话 ${sessionId.slice(0, 8)}`,
+    const operationId = pending?.operationId ?? randomUUID();
+    if (pending) {
+      const registered = this.store.channel(pending.payload.channelId);
+      if (registered && (registered.projectId !== project.projectId
+        || (registered.sessionId && registered.sessionId !== sessionId))) {
+        await context.helpers.editOriginal({ content: '恢复记录中的频道状态无法确认，请先检查工作台操作记录。' });
+        return;
+      }
+      try {
+        const recorded = await this.#api.getChannel({ channelId: pending.payload.channelId });
+        if (String(recorded.id) !== pending.payload.channelId || recorded.guild_id !== this.#workbench.guildId
+          || recorded.type !== 0 || recorded.parent_id !== project.categoryId) throw new Error('Restore route changed');
+        channel = recorded;
+      } catch (error) {
+        if (error?.status === 404 || error?.code === 10003) {
+          if (registered) await this.store.detachChannel(registered.channelId);
+          await this.store.completeOperation(operationId);
+          return this.#restoreSession(context, sessionId);
+        }
+        await context.helpers.editOriginal({ content: '恢复记录中的频道状态无法确认，请先检查工作台操作记录。' });
+        return;
+      }
+    } else {
+      if (!await this.#hasChannelCapacity(context, project.categoryId)) return;
+      await this.store.beginOperation({
+        operationId, kind: 'restore-channel', state: 'channel-creating', payload: { sessionId },
+      });
+      try {
+        channel = await this.#api.createGuildChannel({
+          guildId: this.#workbench.guildId,
+          name: (session.title ?? `恢复会话 ${sessionId.slice(0, 8)}`).slice(0, 100),
+          type: 0,
+          parentId: project.categoryId,
+          topic: 'DSH 工作台会话 · 恢复',
+        });
+      } catch (error) {
+        if (Number(error?.status) >= 400 && Number(error?.status) < 500) await this.store.completeOperation(operationId);
+        else await this.store.updateOperation(operationId, { state: 'channel-create-unknown' });
+        this.#logger.warn?.('[dsh-im:discord] restore channel creation failed:', error);
+        await context.helpers.editOriginal({ content: '创建恢复频道失败，请检查频道数量上限与权限。' });
+        return;
+      }
+      await this.store.updateOperation(operationId, {
+        state: 'channel-created',
+        payload: { sessionId, channelId: String(channel.id), projectId: project.projectId },
+      });
+    }
+    await withSessionBindingLock(this.store, `channel:${channel.id}`, async () => {
+      await this.store.registerChannel({
+        channelId: String(channel.id),
+        projectId: project.projectId,
+        title: session.title ?? `恢复会话 ${sessionId.slice(0, 8)}`,
+      });
+      await this.store.setChannelLifecycle(String(channel.id), CHANNEL_LIFECYCLE.ARCHIVED);
+      await this.#workbench.prepareChannel(String(channel.id));
+      await this.store.bindChannelSession(String(channel.id), sessionId, {
+        title: session.title ?? `恢复会话 ${sessionId.slice(0, 8)}`,
+      });
+      await this.store.setChannelLifecycle(String(channel.id), CHANNEL_LIFECYCLE.ACTIVE);
     });
-    await this.store.bindChannelSession(String(channel.id), sessionId, {
-      title: session.title ?? `恢复会话 ${sessionId.slice(0, 8)}`,
-    });
-    await this.store.setChannelLifecycle(String(channel.id), CHANNEL_LIFECYCLE.ACTIVE);
     await this.store.completeOperation(operationId);
     await context.helpers.editOriginal({
       content: `已在原项目创建频道 <#${channel.id}> 并恢复会话 \`${sessionId}\`。`,
@@ -873,29 +1042,80 @@ export class WorkbenchCommands {
       await context.helpers.editOriginal({ content: '暂时无法读取模型目录。' });
       return;
     }
+    const catalog = await this.#harness.getSessionModels(channel.sessionId);
+    const model = catalog.groups?.find((group) => group.id === catalog.current?.provider)?.models
+      .find((item) => item.id === catalog.current?.model);
+    const rows = [selectRow];
+    const efforts = model?.reasoning?.efforts?.filter((item) => item.id.length <= 100).slice(0, 25) ?? [];
+    if (efforts.length) {
+      const actionId = randomUUID();
+      await this.store.putAction({
+        actionId, kind: 'reasoning', guildId: this.#workbench.guildId,
+        channelId: channel.channelId, sessionId: channel.sessionId,
+        payload: { provider: catalog.current.provider, model: catalog.current.model },
+        expiresAt: this.#now() + ACTION_TTL_MS,
+      });
+      rows.push({ type: 1, components: [{
+        type: 3, custom_id: componentId('reasoning', actionId), placeholder: '推理强度',
+        min_values: 1, max_values: 1,
+        options: efforts.map((item) => ({
+          label: item.name.slice(0, 100), value: item.id,
+          default: item.id === (catalog.current.reasoningEffort ?? model.reasoning.defaultEffort),
+        })),
+      }] });
+    }
     await context.helpers.editOriginal({
-      content: `当前会话模型：\`${this.#modelSelection(channel.sessionId)?.model ?? '跟随会话默认'}\``,
-      components: [selectRow],
+      content: `当前会话模型：\`${catalog.current?.provider}/${catalog.current?.model}\``,
+      components: rows,
     });
   }
 
   async #selectModel(context) {
     await context.helpers.defer({ ephemeral: true });
+    if (!await this.#actionStillCurrent(context)) return;
     const channel = this.store.channel(context.channelId);
     const rawValue = context.interaction?.data?.values?.[0];
-    const [provider, model] = String(rawValue ?? '').split('/');
+    const value = String(rawValue ?? '');
+    const separator = value.indexOf('/');
+    const provider = separator > 0 ? value.slice(0, separator) : '';
+    const model = separator > 0 ? value.slice(separator + 1) : '';
     if (!channel?.sessionId || !provider || !model) {
       await context.helpers.editOriginal({ content: '无法识别所选模型。' });
       return;
     }
     try {
-      await this.#harness.selectSessionModel(channel.sessionId, { provider, model });
-      this.#models.set(channel.sessionId, { provider, model });
-      await context.helpers.editOriginal({ content: `已切换当前会话模型：\`${provider}/${model}\`` });
+      const catalog = await this.#harness.getSessionModels(channel.sessionId);
+      if (!catalog.groups?.some((group) => group.id === provider && group.models.some((item) => item.id === model))) {
+        throw new Error('Model is not in the Session catalog');
+      }
+      if (!await this.#actionStillCurrent(context)) return;
+      const result = await this.#harness.selectSessionModel(channel.sessionId, { provider, model });
+      this.#models.set(channel.sessionId, result.selected);
+      await this.#modelCard(context);
     } catch (error) {
       this.#logger.warn?.('[dsh-im:discord] model switch failed:', error);
       await context.helpers.editOriginal({ content: '切换模型失败，请确认模型可用后重试。' });
     }
+  }
+
+  async #selectReasoning(context) {
+    await context.helpers.defer({ ephemeral: true });
+    if (!await this.#actionStillCurrent(context)) return;
+    const sessionId = context.action.sessionId;
+    const catalog = await this.#harness.getSessionModels(sessionId);
+    const model = catalog.groups?.find((group) => group.id === catalog.current?.provider)?.models
+      .find((item) => item.id === catalog.current?.model);
+    const effort = context.interaction.data?.values?.[0];
+    if (catalog.current?.provider !== context.action.payload.provider
+      || catalog.current?.model !== context.action.payload.model
+      || !model?.reasoning?.efforts?.some((item) => item.id === effort)) {
+      await context.helpers.editOriginal({ content: '模型或推理强度选项已失效，请重新打开 /model。' });
+      return;
+    }
+    if (!await this.#actionStillCurrent(context)) return;
+    const result = await this.#harness.selectSessionModel(sessionId, { ...catalog.current, reasoningEffort: effort });
+    this.#models.set(sessionId, result.selected);
+    await context.helpers.editOriginal({ content: `当前会话推理强度：\`${result.selected.reasoningEffort}\`` });
   }
 
   // ---- tasks ---------------------------------------------------------------
@@ -907,7 +1127,7 @@ export class WorkbenchCommands {
       await context.helpers.editOriginal({ content: '当前频道还没有会话。' });
       return;
     }
-    const stopped = await this.#harness.stopActiveTurn(channel.sessionId, { owner: this })
+    const stopped = await this.#harness.stopActiveTurn(channel.sessionId, { owner: this.#controlOwner, key: `group:${context.channelId}` })
       .catch(() => false);
     await context.helpers.editOriginal({
       content: stopped ? '已发送停止请求。' : '当前没有可停止的任务。',
@@ -926,11 +1146,15 @@ export class WorkbenchCommands {
 
   async #applySteer(context, text) {
     const channel = this.store.channel(context.channelId);
+    if (context.action && channel?.sessionId !== context.action.sessionId) {
+      await context.helpers.editOriginal({ content: '这个操作已失效，请刷新会话信息卡后重试。' });
+      return;
+    }
     if (!channel?.sessionId) {
       await context.helpers.editOriginal({ content: '当前频道还没有会话。' });
       return;
     }
-    const applied = await this.#harness.steerActiveTurn(channel.sessionId, text, { owner: this })
+    const applied = await this.#harness.steerActiveTurn(channel.sessionId, text, { owner: this.#controlOwner, key: `group:${context.channelId}` })
       .catch(() => false);
     await context.helpers.editOriginal({
       content: applied ? '补充指令已提交给运行中的任务。' : '当前没有可补充指令的运行中任务。',
@@ -970,9 +1194,10 @@ export class WorkbenchCommands {
 
   async #stopFromCard(context) {
     await context.helpers.defer({ ephemeral: true });
+    if (!await this.#actionStillCurrent(context)) return;
     const sessionId = context.action?.sessionId;
     const stopped = sessionId
-      ? await this.#harness.stopActiveTurn(sessionId, { owner: this }).catch(() => false)
+      ? await this.#harness.stopActiveTurn(sessionId, { owner: this.#controlOwner, key: `group:${context.channelId}` }).catch(() => false)
       : false;
     await context.helpers.editOriginal({ content: stopped ? '已停止。' : '当前没有可停止的任务。' });
   }
@@ -1008,6 +1233,7 @@ export class WorkbenchCommands {
 
   async #archiveFromCard(context) {
     await context.helpers.defer({ ephemeral: true });
+    if (!await this.#actionStillCurrent(context)) return;
     const channel = this.store.channel(context.channelId);
     if (!channel) {
       await context.helpers.editOriginal({ content: '频道不在工作台管理中。' });
@@ -1019,26 +1245,84 @@ export class WorkbenchCommands {
 
   async #deepArchiveFromCard(context) {
     await context.helpers.defer({ ephemeral: true });
-    const channel = this.store.channel(context.channelId);
-    if (!channel) {
-      await context.helpers.editOriginal({ content: '频道不在工作台管理中。' });
+    let permissions = 0n;
+    try { permissions = BigInt(context.interaction.app_permissions ?? '0'); } catch {}
+    const required = (1n << 4n) | (1n << 10n) | (1n << 16n);
+    if ((permissions & 8n) === 0n && (permissions & required) !== required) {
+      await context.helpers.editOriginal({ content: '无法确认读取完整频道历史及删除频道的权限，未删除。请授予查看频道、读取消息历史和管理频道权限。' });
       return;
     }
-    await this.store.setChannelLifecycle(channel.channelId, CHANNEL_LIFECYCLE.DEEP_ARCHIVED);
-    try {
-      await this.#api.deleteChannel({ channelId: channel.channelId });
-    } catch (error) {
-      this.#logger.warn?.('[dsh-im:discord] deep archive could not delete the channel:', error);
-      await this.store.noteChannelError(channel.channelId, '深度归档：频道删除失败，将重试。');
-    }
-    await this.store.detachChannel(channel.channelId);
-    await context.helpers.editOriginal({
-      content: `已深度归档。会话 \`${channel.sessionId ?? '（无）'}\` 已保留，可用 /session restore 恢复。`,
+    return withSessionBindingLock(this.store, `channel:${context.channelId}`, async () => {
+      const channel = this.store.channel(context.channelId);
+      if (!channel || channel.sessionId !== context.action.sessionId) {
+        await context.helpers.editOriginal({ content: '这个操作已失效，请刷新会话信息卡后重试。' });
+        return;
+      }
+      const pendingTask = this.store.listOperations().some((operation) => operation.kind === 'message-task'
+        && operation.payload.channelId === channel.channelId
+        && !['delivered', 'failed', 'interrupted', 'cancelled'].includes(operation.state));
+      if (pendingTask) {
+        await context.helpers.editOriginal({ content: '频道还有未核实或未投递的任务，未删除。请先在 DSH 核对任务结果。' });
+        return;
+      }
+      if (channel.sessionId) {
+        let running;
+        try {
+          running = await this.#harness.isSessionRunning(channel.sessionId);
+        } catch {
+          await context.helpers.editOriginal({ content: '无法确认任务状态，未删除频道。请稍后重试。' });
+          return;
+        }
+        if (running !== false || (this.#queue?.pendingFor?.(channel.sessionId) ?? 0) > 0) {
+          await context.helpers.editOriginal({ content: '会话仍有运行或排队中的任务。请先停止或等待任务完成，再深度归档。' });
+          return;
+        }
+      }
+      // Stop new channel input before reading the snapshot. On any failure the
+      // channel remains recoverable via /session restore, without deleting it.
+      await this.store.setChannelLifecycle(channel.channelId, CHANNEL_LIFECYCLE.ARCHIVED);
+      const operationId = `archive:${channel.channelId}`;
+      await this.store.beginOperation({ operationId, kind: 'deep-archive', state: 'saving',
+        payload: { channelId: channel.channelId, sessionId: channel.sessionId } });
+      let snapshot;
+      try {
+        snapshot = await saveArchiveSnapshot({ root: this.store.archiveDirectory, channel,
+          api: this.#api, harness: this.#harness, signal: AbortSignal.timeout(120_000) });
+        if (channel.sessionId && (await this.#harness.isSessionRunning(channel.sessionId) !== false
+          || (this.#queue?.pendingFor?.(channel.sessionId) ?? 0) > 0)) throw new Error('Session became active during archive');
+        const newest = await this.#api.listChannelMessages({ channelId: channel.channelId, limit: 1 });
+        if (!Array.isArray(newest) || (newest[0]?.id ?? null) !== snapshot.newestMessageId) {
+          throw new Error('Channel changed during archive');
+        }
+        await this.store.updateOperation(operationId, { state: 'saved',
+          payload: { channelId: channel.channelId, sessionId: channel.sessionId, snapshot } });
+      } catch (error) {
+        await this.store.noteChannelError(channel.channelId, '深度归档：历史或附件尚未完整保存，频道已保留。');
+        await context.helpers.editOriginal({ content: '历史或附件尚未完整保存，未删除频道。请检查连接后重试，或 /session restore 恢复。' });
+        return;
+      }
+      await this.store.setChannelLifecycle(channel.channelId, CHANNEL_LIFECYCLE.DEEP_ARCHIVED);
+      try {
+        await this.#api.deleteChannel({ channelId: channel.channelId });
+      } catch (error) {
+        if (error?.status !== 404 && error?.code !== 10003) {
+          this.#logger.warn?.('[dsh-im:discord] deep archive could not delete the channel:', error);
+          await this.store.noteChannelError(channel.channelId, '深度归档：频道删除失败，请检查权限后重试。');
+          await context.helpers.editOriginal({ content: '频道删除失败，已保留归档记录。请检查权限后重试，或用 /session restore 恢复。' });
+          return;
+        }
+      }
+      await this.store.detachChannel(channel.channelId);
+      await this.store.updateOperation(operationId, { state: 'deleted' });
+      await context.helpers.editOriginal({
+        content: `已深度归档。会话 \`${channel.sessionId ?? '（无）'}\` 已保留，可用 /session restore 恢复。`,
+      });
     });
   }
 
   async #restoreFromCard(context) {
     await context.helpers.defer({ ephemeral: true });
+    if (!await this.#actionStillCurrent(context)) return;
     const channel = this.store.channel(context.channelId);
     if (!channel?.sessionId) {
       await context.helpers.editOriginal({ content: '频道没有可恢复的会话。' });
@@ -1054,7 +1338,7 @@ export function steerModal(actionId) {
     type: 9,
     data: {
       title: '补充指令',
-      custom_id: componentId('steer', actionId),
+      custom_id: componentId('steer-submit', actionId),
       components: [{
         type: 1,
         components: [{

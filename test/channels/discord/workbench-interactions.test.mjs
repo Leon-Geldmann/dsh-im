@@ -42,13 +42,15 @@ async function fixture(t, {
   const calls = [];
   let nextId = 1;
   const api = {
+    async listGuildChannels() { return []; },
     calls,
+    async listChannelMessages() { return []; },
     async getChannel({ channelId }) {
       if ([CATEGORY, CATEGORY_BETA, CATEGORY_GAMMA].includes(channelId)) {
         return { id: channelId, type: 4 };
       }
       const channel = channels.find((item) => item.id === channelId);
-      if (channel) return channel;
+      if (channel) return { ...channel, guild_id: GUILD };
       const error = new Error('Unknown Channel');
       error.status = 404;
       throw error;
@@ -109,17 +111,20 @@ async function fixture(t, {
     },
     async getSessionModels() {
       return {
-        providers: [{
-          provider: 'llama-local',
+        groups: [{
+          id: 'llama-local',
           name: 'Local',
-          models: [{ model: 'qwen3.8-27b', name: 'Qwen', selected: true }],
+          models: [{ id: 'qwen3.8-27b', name: 'Qwen' }],
         }],
+        current: { provider: 'llama-local', model: 'qwen3.8-27b' },
+        failures: [], routable: true,
       };
     },
     async readSessionHistory() {
       return {
+        hasMore: false,
         events: [
-          { event: { type: 'user/message', data: { content: [{ type: 'text', text: 'hello there' }] } } },
+          { event: { seq: 0, type: 'user/message', data: { content: [{ type: 'text', text: 'hello there' }] } } },
         ],
       };
     },
@@ -187,6 +192,7 @@ function commandInteraction({ name, subcommand = null, options = {}, channelId =
     id: `9999999999999999${String(Math.floor(Math.random() * 90) + 10)}`,
     token: 'interaction-token',
     application_id: APPLICATION,
+    app_permissions: '66576',
     type: 2,
     guild_id: guildId,
     channel_id: channelId,
@@ -205,6 +211,7 @@ function componentInteraction(customId, { channelId = CHANNEL, guildId = GUILD, 
     id: `9999999999999999${String(Math.floor(Math.random() * 90) + 10)}`,
     token: 'interaction-token',
     application_id: APPLICATION,
+    app_permissions: '66576',
     type: values ? 3 : 3,
     guild_id: guildId,
     channel_id: channelId,
@@ -283,8 +290,13 @@ test('/session new keeps a half-created channel registered when the Session fail
   const channel = f.store.channel(created.resultId);
   assert.equal(channel.sessionId, null);
   assert.match(channel.lastError, /会话创建失败/u);
-  assert.equal(f.store.listOperations().length, 0);
+  const pending = f.store.listOperations();
+  assert.ok(pending.some((op) => op.state === 'channel-created' && op.payload.channelId === created.resultId));
+  assert.ok(pending.some((op) => op.state === 'session-creating' && op.payload.channelId === created.resultId));
   assert.match(lastResponse(f).body.content, /会话创建失败/u);
+  await assert.rejects(f.workbench.router.createForChannel(created.resultId), { code: 'workbench-session-create-uncertain' });
+  assert.equal(f.harnessCalls.filter((call) => call.operation === 'create').length, 1);
+  assert.equal(f.calls.filter((call) => call.operation === 'create-channel').length, 1);
 });
 
 test('/session open refuses a missing Session and keeps the old binding', async (t) => {

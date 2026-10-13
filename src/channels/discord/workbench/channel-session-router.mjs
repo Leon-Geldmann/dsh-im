@@ -30,7 +30,7 @@ export function workbenchRoutingMessage(error) {
     case 'workbench-channel-archived':
       return '该频道已归档，暂时不能提交新任务。请用 /session restore 恢复会话。';
     case 'workbench-session-missing':
-      return '该频道绑定的会话已不存在，原绑定已保留。请用 /session new 新建会话，或 /session open 重新绑定。';
+      return '该频道绑定的会话已不存在，原绑定已保留。请检查 DSH 会话，或用原生 /session new 新建会话频道。';
     case 'workbench-session-unverified':
       return '暂时无法确认会话状态，原绑定已保留，本次消息未提交。请稍后重试。';
     case 'workbench-project-unknown':
@@ -38,7 +38,11 @@ export function workbenchRoutingMessage(error) {
     case 'workbench-channel-unknown':
       return '该频道尚未纳入工作台管理，消息未提交。请在项目分组中新建频道，或用 /session new。';
     case 'workbench-session-create-failed':
-      return '新会话创建失败，消息未提交。请稍后重试或用 /status 查看连接状态。';
+      return '新会话创建或绑定未完成，消息未提交。请用 /status 检查状态；已知会话会重试绑定，结果不明时不会重复创建。';
+    case 'workbench-session-create-uncertain':
+      return '上次会话创建结果尚未确认，本次消息未提交。为避免重复创建，请先检查 DSH 会话与工作台操作记录。';
+    case 'workbench-task-unresolved':
+      return '之前的任务仍在运行或提交结果尚未核实，本次消息未提交。请先在 DSH 核对原任务，确认结束后重发。';
     default:
       return null;
   }
@@ -50,8 +54,9 @@ export class ChannelSessionRouter {
   #logger;
   #createOptions;
   #queue;
+  #state;
 
-  constructor({ store, harness, logger = console, createOptions = {}, queue = null }) {
+  constructor({ store, harness, state = null, logger = console, createOptions = {}, queue = null }) {
     if (!store || typeof store.channel !== 'function') {
       throw new TypeError('ChannelSessionRouter requires the workbench store');
     }
@@ -61,6 +66,7 @@ export class ChannelSessionRouter {
     this.#logger = logger;
     this.#createOptions = createOptions;
     this.#queue = queue;
+    this.#state = state;
   }
 
   get store() { return this.#store; }
@@ -70,14 +76,22 @@ export class ChannelSessionRouter {
    * enforced in code. Control calls (stop, steer, model) go directly to the
    * Harness and never wait behind queued work.
    */
-  #withAdmission(session, { sessionId, projectId }) {
+  #withAdmission(session, { sessionId, projectId, channelId, validateRoute }) {
     if (!this.#queue || typeof session?.ask !== 'function') return session;
     const ask = session.ask.bind(session);
     return Object.freeze({
       ...session,
       ask: (prompt, options) => this.#queue.run(
         { sessionId, projectId },
-        () => ask(prompt, options),
+        async () => {
+          await validateRoute?.();
+          const current = this.#store.channel(channelId);
+          if (!current || current.lifecycle !== 'active') throw new WorkbenchRoutingError(
+            'workbench-channel-archived', 'Channel is no longer active', { channelId, sessionId });
+          if (current.sessionId !== sessionId || current.projectId !== projectId) throw new WorkbenchRoutingError(
+            'workbench-session-unverified', 'Queued routing context changed', { channelId, sessionId });
+          return ask(prompt, options);
+        },
       ),
     });
   }
@@ -98,6 +112,40 @@ export class ChannelSessionRouter {
       );
     }
     return { channel, project };
+  }
+
+  async #setControlBinding(channelId, sessionId, state) {
+    if (!sessionId || !state) return;
+    if (await state.setSession(`group:${channelId}`, sessionId) === false) {
+      throw new WorkbenchRoutingError(
+        'workbench-session-unverified',
+        'The workspace scope refused the managed Session binding',
+        { channelId, sessionId },
+      );
+    }
+  }
+
+  /** Align only this conversation; adopting a Session can change the bot default. */
+  async prepareChannel(channelId, { state = this.#state } = {}) {
+    const id = String(channelId);
+    // Commands may already hold the creation/binding lock when they prepare.
+    return withSessionBindingLock(this.#store, `prepare:${id}`, async () => {
+      const context = this.routingContext(id);
+      if (!context) {
+        throw new WorkbenchRoutingError(
+          'workbench-channel-unknown',
+          'The channel is not managed by the workbench',
+          { channelId: id },
+        );
+      }
+      const key = `group:${id}`;
+      if (typeof this.#harness.currentConversationWorkspace === 'function'
+        && this.#harness.currentConversationWorkspace(key) !== context.project.workspacePath) {
+        await this.#harness.switchConversationWorkspace(key, context.project.workspacePath);
+      }
+      await this.#setControlBinding(id, context.channel.sessionId, state);
+      return context;
+    });
   }
 
   /**
@@ -140,16 +188,10 @@ export class ChannelSessionRouter {
    */
   async resolveForAsk({
     message, sessionExists, createSession, workspaceSession, signal, titleText = null,
+    state = this.#state,
   }) {
     const channelId = String(message?.conversationId ?? '');
-    const context = this.routingContext(channelId);
-    if (!context) {
-      throw new WorkbenchRoutingError(
-        'workbench-channel-unknown',
-        'The channel is not managed by the workbench',
-        { channelId },
-      );
-    }
+    const context = await this.prepareChannel(channelId, { state });
     const { channel, project } = context;
     if (channel.lifecycle !== 'active') {
       throw new WorkbenchRoutingError(
@@ -158,41 +200,42 @@ export class ChannelSessionRouter {
         { channelId },
       );
     }
-    const existsOptions = signal ? { signal } : undefined;
-    if (channel.sessionId) {
-      const session = workspaceSession(this.#harness, channel.sessionId, `group:${channelId}`);
+    const { sessionId, created } = await this.#createForChannel({
+      channelId, project, createSession, signal, titleText,
+    });
+    await this.#setControlBinding(channelId, sessionId, state);
+    const session = workspaceSession(this.#harness, sessionId, `group:${channelId}`);
+    if (!created) {
       try {
         await this.#assertPresent({
-          sessionId: channel.sessionId,
+          sessionId,
           sessionExists,
           session,
           signal,
-          options: existsOptions,
+          options: signal ? { signal } : undefined,
         });
       } catch (error) {
         await this.#recordRoutingError(channelId, error);
         throw error;
       }
-      return {
-        sessionId: channel.sessionId,
-        session: this.#withAdmission(session, {
-          sessionId: channel.sessionId,
-          projectId: project.projectId,
-        }),
-      };
     }
-
-    const sessionId = await this.#createForChannel({
-      channelId, project, createSession, signal, titleText,
-    });
     return {
       sessionId,
-      session: this.#withAdmission(
-        workspaceSession(this.#harness, sessionId, `group:${channelId}`),
-        { sessionId, projectId: project.projectId },
-      ),
-      created: true,
+      session: this.#withAdmission(session, { sessionId, projectId: project.projectId,
+        channelId, validateRoute: message?.validateWorkbenchRoute }),
+      created,
     };
+  }
+
+  /** Native creation and lazy first-message creation share the same journal. */
+  async createForChannel(channelId, { titleText = null } = {}) {
+    const { project } = this.routingContext(String(channelId));
+    const result = await this.#createForChannel({
+      channelId: String(channelId), project, titleText,
+      createSession: (harness, options) => harness.createSession(options),
+    });
+    await this.#setControlBinding(String(channelId), result.sessionId, this.#state);
+    return result;
   }
 
   async #createForChannel({ channelId, project, createSession, signal, titleText }) {
@@ -200,31 +243,55 @@ export class ChannelSessionRouter {
       // Re-read inside the lock: a concurrent first message may have bound the
       // channel while this one waited.
       const channel = this.#store.channel(channelId);
-      if (channel?.sessionId) return channel.sessionId;
-      let sessionId;
-      try {
-        sessionId = await createSession(this.#harness, {
-          workspace: project.workspacePath,
-          conversationKey: `group:${channelId}`,
-          ...(signal ? { signal } : {}),
-          ...this.#createOptions,
-        });
-      } catch (error) {
-        if (signal?.aborted) throw error;
-        const failure = new WorkbenchRoutingError(
-          'workbench-session-create-failed',
-          'The Harness did not create a Session',
-          { channelId },
-        );
-        failure.cause = error;
-        throw failure;
-      }
-      if (typeof sessionId !== 'string' || !sessionId) {
+      const operationId = `session-create:${channelId}`;
+      const operation = this.#store.operation(operationId);
+      if (channel?.sessionId && !operation) return { sessionId: channel.sessionId, created: false };
+      let sessionId = operation?.payload?.sessionId;
+      if (operation && (typeof sessionId !== 'string' || !sessionId)) {
         throw new WorkbenchRoutingError(
-          'workbench-session-create-failed',
-          'The Harness returned an invalid Session id',
+          'workbench-session-create-uncertain',
+          'An earlier Session creation has no confirmed result',
           { channelId },
         );
+      }
+      let created = false;
+      if (!operation) {
+        // Commit intent before the irreversible request. A lost response must
+        // never turn the next message into another create request.
+        await this.#store.beginOperation({
+          operationId,
+          kind: 'create-channel-session',
+          state: 'session-creating',
+          payload: { channelId, projectId: project.projectId, workspacePath: project.workspacePath },
+        });
+        try {
+          sessionId = await createSession(this.#harness, {
+            ...this.#createOptions,
+            workspace: project.workspacePath,
+            conversationKey: `group:${channelId}`,
+            ...(signal ? { signal } : {}),
+          });
+          if (typeof sessionId !== 'string' || !sessionId) {
+            sessionId = null;
+            throw new TypeError('The Harness returned an invalid Session id');
+          }
+          // The id must reach disk before binding: a failed bind can then be
+          // retried for this same Session after a process restart.
+          await this.#store.updateOperation(operationId, {
+            state: 'session-created',
+            payload: { channelId, projectId: project.projectId, workspacePath: project.workspacePath, sessionId },
+          });
+          created = true;
+        } catch (error) {
+          if (signal?.aborted) throw error;
+          const failure = new WorkbenchRoutingError(
+            'workbench-session-create-failed',
+            'The Session creation result could not be confirmed and persisted',
+            { channelId, sessionId },
+          );
+          failure.cause = error;
+          throw failure;
+        }
       }
       try {
         await this.#store.bindChannelSession(channelId, sessionId, {
@@ -241,7 +308,8 @@ export class ChannelSessionRouter {
         failure.cause = error;
         throw failure;
       }
-      return sessionId;
+      await this.#store.completeOperation(operationId);
+      return { sessionId, created };
     });
   }
 
@@ -250,12 +318,13 @@ export class ChannelSessionRouter {
    * Verified before commit so a typo cannot park the channel on a missing id.
    */
   async bindExistingSession(channelId, sessionId, { workspaceSession, sessionExists, signal } = {}) {
-    const context = this.routingContext(channelId);
-    if (!context) {
+    channelId = String(channelId);
+    const context = await this.prepareChannel(channelId);
+    if (context.channel.sessionId && context.channel.sessionId !== sessionId) {
       throw new WorkbenchRoutingError(
-        'workbench-channel-unknown',
-        'The channel is not managed by the workbench',
-        { channelId },
+        'workbench-session-conflict',
+        'A managed channel cannot change its Session binding',
+        { channelId, sessionId: context.channel.sessionId },
       );
     }
     const session = workspaceSession(this.#harness, sessionId, `group:${channelId}`);
@@ -275,9 +344,9 @@ export class ChannelSessionRouter {
       );
     }
     await this.#store.bindChannelSession(channelId, sessionId, {
-      replace: true,
       projectId: context.project.projectId,
     });
+    await this.#setControlBinding(channelId, sessionId, this.#state);
     return session;
   }
 }

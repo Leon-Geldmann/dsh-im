@@ -4,28 +4,34 @@ import { harnessQuestionText } from '../shared/harness-question.mjs';
 const MAX_QUESTION_BUTTONS = 5;
 
 /**
- * Native question card: one button per option.
- *
- * Multi-select needs an accumulating control plus a submit action that Discord
- * buttons alone cannot express with this bridge, so it returns null and the
- * shared text flow keeps answering the question (an explicit fallback, not a
- * silent one: the prompt still lists the options).
+ * Native questions use buttons for short single choices and a string select
+ * for larger or multiple choices. Text replies remain available for additions.
  */
 export const DISCORD_INTERACTION_CARD = Object.freeze({
   render(question, { questionIndex = 0, total = 1, requiresMention = false, nonce } = {}) {
     if (typeof nonce !== 'string' || !nonce) return null;
     const options = Array.isArray(question?.options) ? question.options : [];
-    if (options.length === 0 || options.length > MAX_QUESTION_BUTTONS) return null;
-    if (question.multiSelect === true) return null;
+    if (options.length === 0 || options.length > 25) return null;
     if (options.some((option) => typeof option?.label !== 'string' || !option.label.trim())) {
       return null;
     }
+    const useSelect = question.multiSelect === true || options.length > MAX_QUESTION_BUTTONS;
     return {
       text: harnessQuestionText(question, questionIndex, total, {
         requiresMention,
         hasButtons: true,
       }),
-      markup: {
+      markup: useSelect ? {
+        components: [{ type: 1, components: [{
+          type: 3,
+          custom_id: `wbq:${nonce}:${questionIndex}:select`,
+          min_values: 1,
+          max_values: question.multiSelect === true ? options.length : 1,
+          options: options.map((option, i) => ({
+            label: [...option.label.trim()].slice(0, 100).join(''), value: String(i),
+          })),
+        }] }],
+      } : {
         rows: options.map((option, optionIndex) => [{
           id: `wbq:${nonce}:${questionIndex}:${optionIndex}`,
           label: option.label.trim(),
@@ -40,10 +46,23 @@ export const DISCORD_INTERACTION_CARD = Object.freeze({
     if (parts.length !== 4 || parts[0] !== 'wbq') return null;
     const [, nonce, questionIndex, optionIndex] = parts;
     const question = Number(questionIndex);
+    if (nonce && Number.isSafeInteger(question) && question >= 0 && optionIndex === 'select') {
+      return { nonce, questionIndex: question, mode: 'select' };
+    }
     const option = Number(optionIndex);
     if (!nonce || !Number.isSafeInteger(question) || question < 0
       || !Number.isSafeInteger(option) || option < 0) return null;
     return { nonce, questionIndex: question, optionIndex: option };
+  },
+  answer(question, parsed, callback) {
+    if (parsed?.mode !== 'select') return null;
+    const values = callback?.values;
+    if (!Array.isArray(values) || values.length === 0 || new Set(values).size !== values.length
+      || (question.multiSelect !== true && values.length !== 1)) return null;
+    const options = question.options ?? [];
+    if (values.some((value) => typeof value !== 'string' || !/^(?:0|[1-9]\d*)$/.test(value)
+      || !options[Number(value)])) return null;
+    return { id: question.id, selected: values.map((value) => options[Number(value)].label) };
   },
 });
 

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { t } from '../shared/i18n.mjs';
+import { fetchFileStream } from '../shared/file-download.mjs';
 import { DiscordRateLimiter, rateLimitRouteKey } from './workbench/rate-limiter.mjs';
 
 const DEFAULT_BASE_URL = 'https://discord.com/api/v10/';
@@ -79,19 +80,12 @@ function uncertainDiscordDelivery(cause) {
   return preserveProviderMetadata(error, cause);
 }
 
-function delay(ms, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
-      return;
-    }
-    const timer = setTimeout(resolve, ms);
-    timer?.unref?.();
-    signal?.addEventListener('abort', () => {
-      clearTimeout(timer);
-      reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
-    }, { once: true });
-  });
+function safeMentions(value) {
+  return { parse: [], replied_user: false, ...value };
+}
+
+function messageBody(body) {
+  return { ...body, allowed_mentions: safeMentions(body?.allowed_mentions) };
 }
 
 function snowflake(value, name) {
@@ -155,6 +149,22 @@ export class DiscordApi {
     });
   }
 
+  listChannelMessages({ channelId, limit = 100, before, signal } = {}) {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new TypeError('Invalid message limit');
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (before) query.set('before', snowflake(before, 'message id'));
+    return this.#request(`channels/${snowflake(channelId, 'channel id')}/messages?${query}`, {
+      method: 'GET', signal,
+    });
+  }
+
+  downloadAttachment({ url, signal } = {}) {
+    return fetchFileStream(url, {
+      fetchImpl: this.#fetch, signal,
+      allowedHosts: ['cdn.discordapp.com', 'media.discordapp.net'],
+    });
+  }
+
   getMessage({ channelId, messageId, signal } = {}) {
     return this.#request(
       `channels/${snowflake(channelId, 'channel id')}/messages/${snowflake(messageId, 'message id')}`,
@@ -187,7 +197,7 @@ export class DiscordApi {
       signal,
       body: {
         content,
-        allowed_mentions: allowedMentions ?? { parse: [], replied_user: false },
+        allowed_mentions: safeMentions(allowedMentions),
         ...(components ? { components } : {}),
         ...(embeds ? { embeds } : {}),
         ...(Number.isInteger(flags) ? { flags } : {}),
@@ -209,9 +219,10 @@ export class DiscordApi {
       || !Buffer.isBuffer(file.bytes)) {
       throw new TypeError('A Discord attachment is required');
     }
+    const targetChannelId = snowflake(channelId, 'channel id');
     const deliverySeed = cleanString(file.deliveryKey) ?? cleanString(file.artifactId);
     const nonce = deliverySeed
-      ? createHash('sha256').update(deliverySeed).digest('hex').slice(0, 25)
+      ? createHash('sha256').update(JSON.stringify([targetChannelId, deliverySeed])).digest('hex').slice(0, 25)
       : undefined;
     const payload = new FormData();
     payload.append('payload_json', JSON.stringify({
@@ -231,7 +242,6 @@ export class DiscordApi {
       new Blob([file.bytes], { type: file.mediaType ?? 'application/octet-stream' }),
       file.fileName,
     );
-    const targetChannelId = snowflake(channelId, 'channel id');
     if (signal?.aborted) throw abortReason(signal);
     const upload = requestSignal(signal, this.#fileUploadTimeoutMs);
     try {
@@ -263,7 +273,7 @@ export class DiscordApi {
         signal,
         body: {
           content,
-          allowed_mentions: allowedMentions ?? { parse: [], replied_user: false },
+          allowed_mentions: safeMentions(allowedMentions),
           ...(components ? { components } : {}),
           ...(embeds ? { embeds } : {}),
         },
@@ -390,7 +400,10 @@ export class DiscordApi {
     const query = withResponse ? '?with_response=true' : '';
     return this.#request(
       `interactions/${snowflake(interactionId, 'interaction id')}/${token}/callback${query}`,
-      { method: 'POST', signal, body, retry: false },
+      {
+        method: 'POST', signal, retry: false,
+        body: [4, 7].includes(body?.type) ? { ...body, data: messageBody(body.data) } : body,
+      },
     );
   }
 
@@ -400,7 +413,7 @@ export class DiscordApi {
     if (!token) throw new TypeError('An interaction token is required');
     return this.#request(
       `webhooks/${snowflake(applicationId, 'application id')}/${token}/messages/@original`,
-      { method: 'PATCH', signal, body },
+      { method: 'PATCH', signal, body: messageBody(body) },
     );
   }
 
@@ -411,7 +424,7 @@ export class DiscordApi {
     if (!token) throw new TypeError('An interaction token is required');
     return this.#request(
       `webhooks/${snowflake(applicationId, 'application id')}/${token}${wait ? '?wait=true' : ''}`,
-      { method: 'POST', signal, body },
+      { method: 'POST', signal, body: messageBody(body) },
     );
   }
 
@@ -425,14 +438,19 @@ export class DiscordApi {
     multipart = false,
   }) {
     const routeKey = rateLimitRouteKey(method, path);
-    await this.#rateLimiter.wait(routeKey, { signal });
+    // Token-authenticated interaction endpoints have their own limits. Bot
+    // global cooldowns must not consume the three-second acknowledgement window.
+    const tokenAuthenticated = /^(?:interactions|webhooks)\//.test(path);
+    signal?.throwIfAborted();
+    await this.#rateLimiter.wait(routeKey, { signal, global: !tokenAuthenticated });
+    signal?.throwIfAborted();
     const timeout = requestSignal(signal, timeoutMs);
     let response;
     try {
       response = await this.#fetch(new URL(path, this.#baseUrl), {
         method,
         headers: {
-          authorization: `Bot ${this.#token}`,
+          ...(tokenAuthenticated ? {} : { authorization: `Bot ${this.#token}` }),
           ...(multipart ? {} : { 'content-type': 'application/json' }),
           'user-agent': 'DeepSeek-Harness-dsh-im (https://github.com/xmanrui/dsh-im, 1.1.0)',
         },
@@ -446,13 +464,14 @@ export class DiscordApi {
       throw new Error(`Discord ${method} transport failed`, { cause: error });
     }
 
+    this.#rateLimiter.observe(routeKey, response.headers, { status: response.status });
     let parsed = null;
     try {
-      if (expectBody || response.status === 429 || !response.ok) {
+      if (response.status !== 204 && (expectBody || !response.ok)) {
         try {
           parsed = await response.json();
         } catch (cause) {
-          if (expectBody) {
+          if (expectBody && response.ok) {
             const error = new Error(`Discord ${method} returned invalid JSON`, { cause });
             error.status = response?.status;
             throw error;
@@ -462,19 +481,22 @@ export class DiscordApi {
     } finally {
       timeout.dispose();
     }
-    if (response.status === 429 && retry) {
+    if (response.status === 429) {
       // Schedule from the platform's own bucket state instead of a fixed
       // backoff; the limiter also pauses every bucket on a global limit.
       await this.#rateLimiter.penalize(routeKey, {
         headers: response.headers,
         body: parsed,
         signal,
+        wait: retry,
+        global: !tokenAuthenticated,
       });
-      return this.#request(path, {
-        method, body, signal, timeoutMs, expectBody, retry: false, multipart,
-      });
+      if (retry) {
+        return this.#request(path, {
+          method, body, signal, timeoutMs, expectBody, retry: false, multipart,
+        });
+      }
     }
-    this.#rateLimiter.observe(routeKey, response.headers, { status: response.status });
     if (!response.ok) {
       const error = new Error(cleanString(parsed?.message) ?? `Discord API failed with HTTP ${response.status}`);
       error.code = `discord-${response.status}`;
