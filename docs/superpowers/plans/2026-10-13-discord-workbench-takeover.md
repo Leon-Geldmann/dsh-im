@@ -111,8 +111,8 @@
 - [x] 进行一次独立代码审查，修复实际影响需求的发现并回归相关测试。
 - [x] 更新文档中的已过时限制、恢复语义、附件保留策略、深度归档、同步范围、独立安装/升级/备份/回滚及真实验收清单。
 - [x] 检查安装包包含配置脚本和所需源文件；生成包与 SHA-256。
-- [ ] 提交接续成果、推送 `origin feat/discord-guild-workbench`，核实远端 commit 与本地一致。
-- [ ] 交付 Fork/分支/commit、实测版本和测试结果、安装包、明确限制。真实 Discord 联调若无凭据标记未验证。
+- [x] 提交接续成果、推送 `origin feat/discord-guild-workbench`，核实远端 commit 与本地一致。
+- [x] 交付 Fork/分支/commit、实测版本和测试结果、安装包、明确限制。真实 Discord 联调若无凭据标记未验证。
 
 ## 执行记录
 
@@ -124,3 +124,5 @@
 - 最终 `npm run check` 退出码 0：4174 tests / 4174 pass / 0 fail / 0 cancelled / 0 skipped；构建及包验证通过。Discord 定向测试最近一次 237/237。完整日志 `/tmp/dsh-im-final-check-20261013.log`。
 - 测试进程对模拟传输增加 keep-alive preload，并设置每项 60 秒上限，解决 AbortSignal.timeout/unref 在无网络句柄时提前取消测试；未改变生产超时语义。
 - 验证范围为本地 Mock、构建和包内容；没有测试 Bot 配置，真实 Discord/代理链路和隔离 Profile 实装联调未验证。
+
+- 实现提交 `6f29d61e2a6fb625f2f6efcead8888428985d677` 已推送 Fork，`git ls-remote` 与本地一致。安装包、校验值与验收边界见 `docs/discord-workbench-delivery-2026-10-13.md`。后续提交仅补充本交付记录。
